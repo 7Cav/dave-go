@@ -125,6 +125,77 @@ func TestRebuildEpochState_RejectsDuplicateIdentity(t *testing.T) {
 	}
 }
 
+// TestOnDaveMLSPrepareCommitTransition_OverPendingEpoch verifies that a peer's
+// commit is processed on top of a pending epoch the session did not commit
+// itself, and only rolls back a pending epoch from our own commit.
+func TestOnDaveMLSPrepareCommitTransition_OverPendingEpoch(t *testing.T) {
+	tests := []struct {
+		name                string
+		welcomeTransitionID uint16
+		earlierPeerCommits  int
+		ownCommit           bool
+	}{
+		{name: "welcome not executed", welcomeTransitionID: 5},
+		{name: "peer commit not executed", earlierPeerCommits: 1},
+		{name: "our commit lost", ownCommit: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ctx := context.Background()
+			cb := &kpCapturingCallbacks{}
+			s := New("123456789", cb)
+			closeAtCleanup(t, s)
+			s.SetChannelID(987654321)
+			s.OnSelectProtocolAck(1)
+			externalSenderPackage, extPriv := buildExternalSenderPackageWithKey(t)
+			setExternalSenderPackage(t, s, externalSenderPackage)
+			peer, groupID, welcome := newPeerGroupForExternalSender(t, cb.lastKeyPackage(), externalSenderPackage)
+			s.OnDaveMLSWelcome(tt.welcomeTransitionID, welcome)
+
+			peerCommit := func() []byte {
+				t.Helper()
+				commit, _, err := peer.CommitPendingProposals(ctx, groupID)
+				if err != nil {
+					t.Fatalf("peer.CommitPendingProposals: %v", err)
+				}
+
+				return commit
+			}
+			transitionID := tt.welcomeTransitionID
+			for range tt.earlierPeerCommits {
+				transitionID++
+				s.OnDaveMLSPrepareCommitTransition(transitionID, peerCommit())
+			}
+			if tt.ownCommit {
+				const joiner = "222222222"
+				s.AddUser(joiner)
+				s.OnDaveMLSProposals(buildProposalBatch(addProposalBytesForUser(t, s, extPriv, joiner)))
+				s.mu.RLock()
+				committed := len(s.pendingCommitBytes) > 0
+				s.mu.RUnlock()
+				if !committed {
+					t.Fatal("session did not commit the proposal")
+				}
+			}
+			transitionID++
+			s.OnDaveMLSPrepareCommitTransition(transitionID, peerCommit())
+
+			if got, want := s.Stats().CommitsProcessed, uint64(tt.earlierPeerCommits+1); got != want {
+				t.Fatalf("CommitsProcessed = %d, want %d", got, want)
+			}
+			wantEpoch, err := peer.Epoch(ctx, groupID)
+			if err != nil {
+				t.Fatalf("peer.Epoch: %v", err)
+			}
+			s.mu.RLock()
+			defer s.mu.RUnlock()
+			if s.pendingEpoch == nil || s.pendingEpoch.id != wantEpoch {
+				t.Fatalf("pending epoch = %+v, want epoch %d", s.pendingEpoch, wantEpoch)
+			}
+		})
+	}
+}
+
 func mustIdentity(t *testing.T, userID string) []byte {
 	t.Helper()
 	id, err := userIDToIdentityBytes(godave.UserID(userID))

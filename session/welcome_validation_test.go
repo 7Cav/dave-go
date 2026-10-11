@@ -41,9 +41,16 @@ func peerWithIdentity(t *testing.T, userID string) *mls.Client {
 
 func newWelcomeForExternalSender(t *testing.T, botKP, externalSenderPackage []byte) (groupID, welcome []byte) {
 	t.Helper()
+	_, groupID, welcome = newPeerGroupForExternalSender(t, botKP, externalSenderPackage)
+
+	return groupID, welcome
+}
+
+func newPeerGroupForExternalSender(t *testing.T, botKP, externalSenderPackage []byte) (peer *mls.Client, groupID, welcome []byte) {
+	t.Helper()
 
 	ctx := context.Background()
-	peer := peerWithIdentity(t, "987654321")
+	peer = peerWithIdentity(t, "987654321")
 	peerKP, err := peer.FreshKeyPackageBytes(ctx)
 	if err != nil {
 		t.Fatalf("peer.FreshKeyPackageBytes: %v", err)
@@ -57,7 +64,7 @@ func newWelcomeForExternalSender(t *testing.T, botKP, externalSenderPackage []by
 		t.Fatalf("InviteMember: %v", err)
 	}
 
-	return groupID, welcome
+	return peer, groupID, welcome
 }
 
 func TestOnDaveMLSWelcome_ValidatesExternalSender(t *testing.T) {

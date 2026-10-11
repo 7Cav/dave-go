@@ -834,7 +834,7 @@ func (s *Session) processAndCommitProposalBatchLocked(proposals []byte) {
 // transition must be aborted because the state restore or the commit processing
 // failed. Must be called with s.mu held.
 func (s *Session) reconcileCompetingCommitLocked(transitionID uint16, commitMessage []byte) bool {
-	if s.pendingEpoch != nil {
+	if len(s.pendingCommitBytes) > 0 {
 		// Our commit lost; restore pre-commit state before processing the winner.
 		s.logger.Debug("OnDaveMLSPrepareCommitTransition: competing commit won, rolling back",
 			"transition_id", transitionID,
