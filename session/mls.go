@@ -135,13 +135,13 @@ func (s *Session) ensurePendingKeyPackageLocked() error {
 		return fmt.Errorf("generate fresh key package: %w", err)
 	}
 
-	s.pendingKeyPackage = append([]byte(nil), kp...)
 	if s.callbacks != nil {
 		// libdave sends the marshaled KeyPackage directly for opcode 26.
 		if err := s.retrySend(func() error { return s.callbacks.SendMLSKeyPackage(kp) }); err != nil {
 			return fmt.Errorf("send mls key package: %w", err)
 		}
 	}
+	s.pendingKeyPackage = append([]byte(nil), kp...)
 
 	return nil
 }
@@ -816,7 +816,7 @@ func (s *Session) createGroupWithExternalSenderLocked() error {
 	if s.channelID == 0 {
 		return ErrNoChannelID
 	}
-	if err := s.ensureMLSClientLocked(); err != nil {
+	if err := s.ensurePendingKeyPackageLocked(); err != nil {
 		return err
 	}
 
