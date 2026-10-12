@@ -20,11 +20,9 @@ func newTestSession() *Session {
 
 func TestRetrySend_SucceedsOnFirstAttempt(t *testing.T) {
 	s := newTestSession()
-	s.mu.Lock()
-	defer s.mu.Unlock()
 
 	calls := 0
-	err := s.retrySend(func() error {
+	err := s.retrySend(nil, func() error {
 		calls++
 
 		return nil
@@ -42,13 +40,11 @@ func TestRetrySend_SucceedsOnFirstAttempt(t *testing.T) {
 
 func TestRetrySend_RetriesOnShardNotReady(t *testing.T) {
 	s := newTestSession()
-	s.mu.Lock()
-	defer s.mu.Unlock()
 
 	shardErr := errors.New("shard is not ready")
 	calls := 0
 
-	err := s.retrySend(func() error {
+	err := s.retrySend(nil, func() error {
 		calls++
 		if calls < 3 {
 			return shardErr
@@ -66,13 +62,11 @@ func TestRetrySend_RetriesOnShardNotReady(t *testing.T) {
 
 func TestRetrySend_GivesUpAfterMaxAttempts(t *testing.T) {
 	s := newTestSession()
-	s.mu.Lock()
-	defer s.mu.Unlock()
 
 	shardErr := errors.New("shard is not ready")
 	calls := 0
 
-	err := s.retrySend(func() error {
+	err := s.retrySend(nil, func() error {
 		calls++
 
 		return shardErr
@@ -87,13 +81,11 @@ func TestRetrySend_GivesUpAfterMaxAttempts(t *testing.T) {
 
 func TestRetrySend_DoesNotRetryOnOtherErrors(t *testing.T) {
 	s := newTestSession()
-	s.mu.Lock()
-	defer s.mu.Unlock()
 
 	otherErr := errors.New("some other error")
 	calls := 0
 
-	err := s.retrySend(func() error {
+	err := s.retrySend(nil, func() error {
 		calls++
 
 		return otherErr
@@ -146,15 +138,13 @@ func TestRetrySend_HonorsClose(t *testing.T) {
 	defer func() { retryDelay = origDelay }()
 
 	s := newTestSession()
-	s.mu.Lock()
-	defer s.mu.Unlock()
 
 	// Run retrySend in a goroutine. The function always returns
 	// "shard not ready" so the retry would otherwise cycle through the
 	// full backoff schedule (~12.5s with production defaults).
 	done := make(chan error, 1)
 	go func() {
-		done <- s.retrySend(func() error {
+		done <- s.retrySend(nil, func() error {
 			return errors.New("shard is not ready")
 		})
 	}()
@@ -189,11 +179,9 @@ func TestRetrySend_ExponentialBackoff(t *testing.T) {
 	}()
 
 	s := newTestSession()
-	s.mu.Lock()
-	defer s.mu.Unlock()
 
 	start := time.Now()
-	err := s.retrySend(func() error {
+	err := s.retrySend(nil, func() error {
 		return errors.New("shard is not ready")
 	})
 	elapsed := time.Since(start)
@@ -224,13 +212,11 @@ func TestRetrySend_TransportRetryDurationAccumulates(t *testing.T) {
 	}()
 
 	s := newTestSession()
-	s.mu.Lock()
-	defer s.mu.Unlock()
 
 	// First call: fails twice with "shard is not ready", then succeeds.
 	// Schedule: sleep(20ms) then sleep(40ms) = 60ms minimum before success.
 	calls := 0
-	err := s.retrySend(func() error {
+	err := s.retrySend(nil, func() error {
 		calls++
 		if calls < 3 {
 			return errors.New("shard is not ready")
@@ -248,7 +234,7 @@ func TestRetrySend_TransportRetryDurationAccumulates(t *testing.T) {
 	}
 
 	// Second call: exhausts all attempts. Must ADD to the counter, not reset it.
-	err = s.retrySend(func() error {
+	err = s.retrySend(nil, func() error {
 		return errors.New("shard is not ready")
 	})
 	if err == nil {
@@ -271,12 +257,10 @@ func TestRetrySend_TransportRetryDurationCountsPartialWaitOnClose(t *testing.T) 
 	defer func() { retryDelay = origDelay }()
 
 	s := newTestSession()
-	s.mu.Lock()
-	defer s.mu.Unlock()
 
 	done := make(chan error, 1)
 	go func() {
-		done <- s.retrySend(func() error {
+		done <- s.retrySend(nil, func() error {
 			return errors.New("shard is not ready")
 		})
 	}()
@@ -295,5 +279,51 @@ func TestRetrySend_TransportRetryDurationCountsPartialWaitOnClose(t *testing.T) 
 
 	if got := s.stats.TransportRetryDuration; got == 0 {
 		t.Fatal("TransportRetryDuration = 0, want > 0 (retry was in progress when Close interrupted it)")
+	}
+}
+
+// TestRetrySend_GivesUpOnceSuperseded verifies that a retry stops, without
+// sending again, once ready is closed by an activation or a reset.
+func TestRetrySend_GivesUpOnceSuperseded(t *testing.T) {
+	tests := []struct {
+		name     string
+		closedAt int
+	}{
+		{name: "before the first attempt", closedAt: 0},
+		{name: "during the back-off", closedAt: 1},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			s := newTestSession()
+			s.retry.delay = time.Hour
+			ready := make(chan struct{})
+			calls := 0
+			if tt.closedAt == 0 {
+				close(ready)
+			}
+
+			done := make(chan error, 1)
+			go func() {
+				done <- s.retrySend(ready, func() error {
+					calls++
+					if calls == tt.closedAt {
+						close(ready)
+					}
+
+					return errors.New("shard is not ready")
+				})
+			}()
+			select {
+			case err := <-done:
+				if !errors.Is(err, errSuperseded) {
+					t.Fatalf("retrySend = %v, want errSuperseded", err)
+				}
+			case <-time.After(time.Second):
+				t.Fatal("retrySend kept backing off after ready closed")
+			}
+			if calls != tt.closedAt {
+				t.Fatalf("send called %d times, want %d", calls, tt.closedAt)
+			}
+		})
 	}
 }

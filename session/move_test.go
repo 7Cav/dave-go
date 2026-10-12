@@ -41,52 +41,14 @@ func (c *kpCapturingCallbacks) lastKeyPackage() []byte {
 	return c.keyPackages[len(c.keyPackages)-1]
 }
 
-// shardDownCallbacks captures key packages (so the MLS flow can proceed) but
-// fails SendMLSCommitWelcome with "shard is not ready" and counts
-// SendInvalidCommitWelcome calls so tests can assert no watchdog fired.
+// shardDownCallbacks fails SendMLSCommitWelcome with "shard is not ready" and
+// counts the other sends, so tests can see the recovery watchdog fire.
 type shardDownCallbacks struct {
-	mu             sync.Mutex
-	keyPackages    [][]byte
-	invalidCommits int
-}
-
-func (c *shardDownCallbacks) SendMLSKeyPackage(kp []byte) error {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	c.keyPackages = append(c.keyPackages, append([]byte(nil), kp...))
-
-	return nil
+	countingCallbacks
 }
 
 func (c *shardDownCallbacks) SendMLSCommitWelcome([]byte) error {
 	return errors.New("shard is not ready")
-}
-
-func (c *shardDownCallbacks) SendReadyForTransition(uint16) error { return nil }
-
-func (c *shardDownCallbacks) SendInvalidCommitWelcome(uint16) error {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	c.invalidCommits++
-
-	return nil
-}
-
-func (c *shardDownCallbacks) lastKeyPackage() []byte {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	if len(c.keyPackages) == 0 {
-		return nil
-	}
-
-	return c.keyPackages[len(c.keyPackages)-1]
-}
-
-func (c *shardDownCallbacks) invalidCommitCount() int {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-
-	return c.invalidCommits
 }
 
 // failingKPCallbacks fails the first failures key package sends with a
@@ -125,6 +87,7 @@ func TestExternalSenderPackage_ResendsUnsentKeyPackage(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			cb := &failingKPCallbacks{failures: tt.failures}
 			s := New("123456789", cb)
+			closeAtCleanup(t, s)
 			s.SetChannelID(987654321)
 			s.OnSelectProtocolAck(1)
 			s.OnDaveMLSExternalSenderPackage(buildExternalSenderPackage(t))
@@ -363,113 +326,37 @@ func buildProposalBatch(proposalBytes []byte) []byte {
 	return append([]byte{0x00}, writeVLBytes(proposalBytes)...)
 }
 
-// TestCommitSend_ShardNotReady_RollsBackAndNoWatchdog verifies the fix for
-// (commit path): when SendMLSCommitWelcome fails because the
-// voice gateway is transiently down ("shard is not ready"), commitProposalsLocked
-// must roll back the local MLS epoch to its pre-commit state and return without
-// arming the recovery watchdog — re-arming it would just loop on a transport
-// problem. The natural OnSelectProtocolAck on reconnect resets the session cleanly.
-func TestCommitSend_ShardNotReady_RollsBackAndNoWatchdog(t *testing.T) {
-	ctx := context.Background()
+// TestCommitSend_ShardNotReady_RollsBackAndArmsRecovery verifies that when
+// SendMLSCommitWelcome fails because the voice gateway is down ("shard is not
+// ready"), commitProposalsLocked rolls the local MLS epoch back to its
+// pre-commit state and arms the recovery watchdog, since a resumed connection
+// brings no OnSelectProtocolAck to reset the session.
+func TestCommitSend_ShardNotReady_RollsBackAndArmsRecovery(t *testing.T) {
 	cb := &shardDownCallbacks{}
-	s := New("123456789", cb)
+	s, extPriv := setupActiveSoleMemberSessionWithKey(t)
+	s.callbacks = cb
 	s.recoveryTimeout = 10 * time.Millisecond
 
-	// --- Bot joins an established group (channel A). ---
-	s.OnSelectProtocolAck(1)
-	externalSenderPackage := buildExternalSenderPackage(t)
-	setExternalSenderPackage(t, s, externalSenderPackage)
-	botKP := cb.lastKeyPackage()
-	if len(botKP) == 0 {
-		t.Fatal("expected a key package after OnSelectProtocolAck")
-	}
-
-	peerStore := memorystore.NewStore()
-	peerIdentity, err := userIDToIdentityBytes("987654321")
-	if err != nil {
-		t.Fatalf("userIDToIdentityBytes: %v", err)
-	}
-
-	peer, err := mls.NewClient(peerIdentity, ciphersuite.MLS128DHKEMP256,
-		mls.WithStorage(peerStore, peerStore),
-		mls.WithCacheStrategy(mls.CacheNone),
-	)
-	if err != nil {
-		t.Fatalf("mls.NewClient(peer): %v", err)
-	}
-
-	peerKP, err := peer.FreshKeyPackageBytes(ctx)
-	if err != nil {
-		t.Fatalf("peer.FreshKeyPackageBytes: %v", err)
-	}
-	groupID, err := peer.CreateGroupWithExternalSender(ctx, []byte("group-shard"), peerKP, externalSenderPackage)
-	if err != nil {
-		t.Fatalf("peer.CreateGroupWithExternalSender: %v", err)
-	}
-
-	_, welcome, err := peer.InviteMember(ctx, groupID, botKP)
-	if err != nil {
-		t.Fatalf("peer.InviteMember(bot): %v", err)
-	}
-
-	s.OnDaveMLSWelcome(0, welcome)
-	if s.Stats().WelcomesJoined != 1 {
-		t.Fatalf("bot did not join welcome: WelcomesJoined=%d WelcomesFailed=%d",
-			s.Stats().WelcomesJoined, s.Stats().WelcomesFailed)
-	}
+	const joiner = "222222222"
+	s.AddUser(joiner)
+	s.OnDaveMLSProposals(buildProposalBatch(addProposalBytesForUser(t, s, extPriv, joiner)))
 
 	s.mu.RLock()
-	if s.activeEpoch == nil || s.sendRatchet == nil {
-		t.Fatal("expected active epoch after joining welcome")
+	if s.pendingEpoch != nil || s.pendingCommitBytes != nil || s.preCommitGroupState != nil {
+		t.Error("pending commit state left behind after the commit was dropped")
+	}
+	epoch, err := s.mlsClient.client.Epoch(context.Background(), s.groupID)
+	if err != nil {
+		t.Fatalf("Epoch: %v", err)
+	}
+	if epoch != s.activeEpoch.id {
+		t.Errorf("group at epoch %d, want %d (not rolled back)", epoch, s.activeEpoch.id)
 	}
 	s.mu.RUnlock()
 
-	// --- A new member wants to join: peer creates an add proposal. ---
-	newMemberStore := memorystore.NewStore()
-	newMemberIdentity, err := userIDToIdentityBytes("111111111")
-	if err != nil {
-		t.Fatalf("userIDToIdentityBytes(new member): %v", err)
-	}
+	eventually(t, func() bool {
+		invalid, _ := cb.counts()
 
-	newMember, err := mls.NewClient(newMemberIdentity, ciphersuite.MLS128DHKEMP256,
-		mls.WithStorage(newMemberStore, newMemberStore),
-		mls.WithCacheStrategy(mls.CacheNone),
-	)
-	if err != nil {
-		t.Fatalf("mls.NewClient(newMember): %v", err)
-	}
-
-	newMemberKP, err := newMember.FreshKeyPackageBytes(ctx)
-	if err != nil {
-		t.Fatalf("newMember.FreshKeyPackageBytes: %v", err)
-	}
-
-	proposalBytes, err := peer.ProposeAddMember(ctx, groupID, newMemberKP)
-	if err != nil {
-		t.Fatalf("peer.ProposeAddMember: %v", err)
-	}
-
-	// --- Gateway sends the proposal to the bot; bot tries to commit but shard is down. ---
-	s.OnDaveMLSProposals(buildProposalBatch(proposalBytes))
-
-	// --- Verify: local MLS state rolled back, no watchdog armed. ---
-	s.mu.RLock()
-	pendingEpoch := s.pendingEpoch
-	preCommitState := s.preCommitGroupState
-	s.mu.RUnlock()
-
-	if pendingEpoch != nil {
-		t.Error("pendingEpoch should be nil after transport rollback")
-	}
-
-	if preCommitState != nil {
-		t.Error("preCommitGroupState should be nil after transport rollback")
-	}
-
-	// Wait well past the recovery timeout; without the fix the watchdog would fire.
-	time.Sleep(5 * s.recoveryTimeout)
-
-	if n := cb.invalidCommitCount(); n != 0 {
-		t.Errorf("recovery watchdog fired despite transport failure: %d SendInvalidCommitWelcome calls", n)
-	}
+		return invalid > 0
+	}, "recovery watchdog not armed after the commit was dropped")
 }

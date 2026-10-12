@@ -27,3 +27,8 @@ var (
 	// Deprecated: no longer returned.
 	ErrNoCodecForSSRC = errors.New("session: no codec assigned for ssrc")
 )
+
+var (
+	errSendFailed = errors.New("session: gateway send failed")
+	errSuperseded = errors.New("session: send no longer wanted")
+)

@@ -1,6 +1,7 @@
 package session
 
 import (
+	"fmt"
 	"strings"
 	"time"
 )
@@ -42,33 +43,31 @@ func isShardNotReady(err error) bool {
 	return err != nil && strings.Contains(err.Error(), "shard is not ready")
 }
 
-// retrySend calls fn up to retryMaxAttempts times, doubling the wait
-// between attempts (capped at retryMaxDelay) when the shard is not
-// ready. The sleep is interruptible: if the session is closed (via
-// Closer.Close) the retry exits early with the context error so
-// shutdown doesn't have to wait for the full backoff to finish.
-//
-// s.mu must be held by the caller; it remains held throughout (including
-// during sleeps) so callers don't need to re-validate state after each attempt.
-func (s *Session) retrySend(fn func() error) error {
+// retrySend calls send until it succeeds, fails with anything other than
+// "shard is not ready", or runs out of attempts, backing off between them.
+// Each attempt holds sendMu and s.mu and the wait holds neither, so the
+// back-off never blocks a handler. It gives up once ready or the session
+// closes.
+func (s *Session) retrySend(ready <-chan struct{}, send func() error) error {
 	delay := s.retry.delay
 
 	// retryStart is set the first time we decide to retry (i.e. the first
-	// "shard is not ready" failure), not at function entry — a single fn()
+	// "shard is not ready" failure), not at function entry — a single send
 	// call's own latency isn't gateway downtime. Accumulated into
-	// Stats.TransportRetryDuration on every exit path (success, exhausted
-	// attempts, or Close() interruption) via defer so there's one place
-	// that does the bookkeeping regardless of how the loop ends.
+	// Stats.TransportRetryDuration on every exit path via defer so there's
+	// one place that does the bookkeeping regardless of how the loop ends.
 	var retryStart time.Time
 
 	defer func() {
 		if !retryStart.IsZero() {
+			s.mu.Lock()
 			s.stats.TransportRetryDuration += time.Since(retryStart)
+			s.mu.Unlock()
 		}
 	}()
 
 	for i := range s.retry.maxAttempts {
-		err := fn()
+		err := s.sendAttempt(ready, send)
 		if err == nil {
 			return nil
 		}
@@ -81,15 +80,21 @@ func (s *Session) retrySend(fn func() error) error {
 			retryStart = time.Now()
 		}
 
-		s.logger.Debug("shard not ready, retrying send",
+		s.mu.RLock()
+		logger := s.logger
+		s.mu.RUnlock()
+		logger.Debug("shard not ready, retrying send",
 			"attempt", i+1,
 			"max_attempts", s.retry.maxAttempts,
 			"delay_ms", delay.Milliseconds())
 
-		// Interruptible sleep: bail out if the session is closed.
 		timer := time.NewTimer(delay)
 		select {
 		case <-timer.C:
+		case <-ready:
+			timer.Stop()
+
+			return errSuperseded
 		case <-s.shutdownCtx.Done():
 			timer.Stop()
 
@@ -101,4 +106,40 @@ func (s *Session) retrySend(fn func() error) error {
 	}
 
 	return nil
+}
+
+// sendAttempt runs one retrySend attempt with sendMu and s.mu held.
+func (s *Session) sendAttempt(ready <-chan struct{}, send func() error) error {
+	s.lockMLS()
+	defer s.unlockMLS()
+	if err := s.shutdownCtx.Err(); err != nil {
+		return err
+	}
+	if isClosed(ready) {
+		return errSuperseded
+	}
+
+	return send()
+}
+
+// sendLocked calls send once with s.mu released, so a callback can call back
+// into the session. The caller must hold sendMu and s.mu; sendMu keeps every
+// other handler and watchdog out until the send returns.
+func (s *Session) sendLocked(send func() error) error {
+	s.mu.Unlock()
+	defer s.mu.Lock()
+	if err := send(); err != nil {
+		return fmt.Errorf("%w: %w", errSendFailed, err)
+	}
+
+	return nil
+}
+
+func isClosed(ch <-chan struct{}) bool {
+	select {
+	case <-ch:
+		return true
+	default:
+		return false
+	}
 }

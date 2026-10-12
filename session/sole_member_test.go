@@ -224,3 +224,60 @@ func TestExternalSenderPackage_GroupIDIsChannelID(t *testing.T) {
 		})
 	}
 }
+
+// TestSetChannelID_DeferredGroupNeverSends verifies that SetChannelID, which
+// disgo calls holding its connection lock, never sends and never waits for a
+// send in progress: either way the deferred group is left to the next external
+// sender package.
+func TestSetChannelID_DeferredGroupNeverSends(t *testing.T) {
+	const channelID godave.ChannelID = 987654321
+	externalSender := buildExternalSenderPackage(t)
+
+	t.Run("key package unsent", func(t *testing.T) {
+		cb := &failingKPCallbacks{failures: 1}
+		s := New("123456789", cb)
+		closeAtCleanup(t, s)
+		s.OnSelectProtocolAck(1)
+		s.OnDaveMLSExternalSenderPackage(externalSender)
+		s.SetChannelID(channelID)
+
+		if cb.lastKeyPackage() != nil {
+			t.Fatal("SetChannelID sent a key package")
+		}
+		assertGroupAfterNextExternalSender(t, s, externalSender)
+	})
+
+	t.Run("send in progress", func(t *testing.T) {
+		cb := newGatedCallbacks()
+		s := New("123456789", cb)
+		closeAtCleanup(t, s)
+		s.OnDaveMLSExternalSenderPackage(externalSender)
+		ackDone := make(chan struct{})
+		go func() {
+			s.OnSelectProtocolAck(1)
+			close(ackDone)
+		}()
+		<-cb.sending
+		within(t, "SetChannelID", func() { s.SetChannelID(channelID) })
+		close(cb.release)
+		<-ackDone
+
+		assertGroupAfterNextExternalSender(t, s, externalSender)
+	})
+}
+
+func assertGroupAfterNextExternalSender(t *testing.T, s *Session, externalSender []byte) {
+	t.Helper()
+	s.mu.RLock()
+	created := len(s.groupID) > 0
+	s.mu.RUnlock()
+	if created {
+		t.Fatal("SetChannelID created the group")
+	}
+	s.OnDaveMLSExternalSenderPackage(externalSender)
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if len(s.groupID) == 0 {
+		t.Fatal("next external sender package did not create the group")
+	}
+}

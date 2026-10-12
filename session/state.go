@@ -34,15 +34,14 @@ type Stats struct {
 	CommitsFailed    uint64
 	WelcomesJoined   uint64
 	WelcomesFailed   uint64
-	// RecoveryAttempts counts recoveries armed by a real MLS fault (invalid
-	// commit/welcome) — see watchRecoveryLocked. Transport-induced skips
-	// (voice gateway down, "shard is not ready") increment
-	// RecoveryAttemptsTransport instead, so an integrator can separate
-	// Discord-side MLS faults from network blips without parsing logs.
+	// RecoveryAttempts counts recovery watchdogs armed, by an MLS fault
+	// (invalid commit/welcome) or by a send the voice gateway never got.
+	// See watchRecoveryLocked.
 	RecoveryAttempts uint64
-	// RecoveryAttemptsTransport counts the number of times a recovery was
-	// skipped because the voice gateway was transiently down ("shard is not
-	// ready"). Distinct from RecoveryAttempts, which only counts MLS faults.
+	// RecoveryAttemptsTransport counts the recovery watchdogs, out of
+	// RecoveryAttempts, armed because a send failed (voice gateway down,
+	// "shard is not ready"), so an integrator can separate Discord-side MLS
+	// faults from network blips without parsing logs.
 	RecoveryAttemptsTransport uint64
 	EncryptFailures           uint64
 	// DecryptFailures counts Decrypt calls that returned an error: plaintext
@@ -80,11 +79,11 @@ type Stats struct {
 	DegradedDuration time.Duration
 	// TransportRetryDuration accumulates the wall-clock time this session
 	// spent inside retrySend backoff loops caused by "shard is not ready"
-	// (voice gateway transiently down), across every call site that uses
-	// retrySend (key package, commit/welcome, ready-for-transition sends).
-	// Counted whether the retry eventually succeeded, exhausted its attempts,
-	// or was cut short by Close(). Unlike RecoveryAttemptsTransport (a count
-	// of skipped recoveries), this answers "how long was the gateway down,
+	// (voice gateway transiently down). Only the recovery watchdogs' key
+	// package sends back off; the handlers send once. Counted whether the
+	// retry eventually succeeded, exhausted its attempts, or was cut short by
+	// Close() or a reset. Unlike RecoveryAttemptsTransport (a count of
+	// recoveries), this answers "how long was the gateway down,
 	// from this session's point of view" — useful to distinguish a brief
 	// blip from a prolonged outage without grepping DEBUG logs.
 	TransportRetryDuration time.Duration

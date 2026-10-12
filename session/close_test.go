@@ -43,9 +43,9 @@ func TestClose_StopsRecoveryWatchdog(t *testing.T) {
 	cb := &countingCallbacks{}
 	s := newRecoveryTestSession(t, cb)
 
-	s.mu.Lock()
+	s.lockMLS()
 	s.invalidateAndResendKeyPackageLocked()
-	s.mu.Unlock()
+	s.unlockMLS()
 
 	// Wait for the first watchdog fire so we know the loop is running.
 	eventually(t, func() bool {
@@ -81,9 +81,9 @@ func TestClose_StopsCommitWatchdog(t *testing.T) {
 	// After Close, any future invalidation must NOT spawn a watchdog
 	// that reaches the callback. The lock-protected path will still
 	// spawn a goroutine, but it must see shutdownCtx.Done() and exit.
-	s.mu.Lock()
+	s.lockMLS()
 	s.invalidateAndResendKeyPackageLocked()
-	s.mu.Unlock()
+	s.unlockMLS()
 
 	time.Sleep(5 * s.recoveryTimeout)
 	invalid, _ := cb.counts()
@@ -185,7 +185,7 @@ func TestWaitShutdown_WaitsForRunningWatchdog(t *testing.T) {
 			arm: func(t *testing.T, s *Session) {
 				t.Helper()
 				s.mu.Lock()
-				s.watchRecoveryLocked()
+				s.watchRecoveryLocked(nil)
 				s.mu.Unlock()
 			},
 		},

@@ -29,6 +29,10 @@ var _ godave.Session = (*Session)(nil)
 // Create one with New, or hand CreateFunc to the voice layer and capture the
 // *Session via WithSessionHook. A Session is single-use per voice connection;
 // call Close when discarding it (channel move, disconnect).
+//
+// The session releases its lock while a callback sends, so a callback may call
+// Encrypt, Decrypt, Ready, State and the other accessors. It must not call an
+// On* handler, which waits for the callback's own send to finish.
 type Session struct {
 	// retry is the send back-off, fixed when the Session is created.
 	retry retryConfig
@@ -44,7 +48,11 @@ type Session struct {
 	userID    godave.UserID
 	callbacks godave.Callbacks
 
-	mu sync.RWMutex
+	// sendMu is held by the On* handlers and by each watchdog send attempt, so
+	// only one of them changes MLS state at a time, including while mu is
+	// released around a send. Lock order: sendMu, then mu, then watchdogMu.
+	sendMu sync.Mutex
+	mu     sync.RWMutex
 
 	channelID       godave.ChannelID
 	protocolVersion uint16
@@ -283,6 +291,12 @@ func (s *Session) MaxSupportedProtocolVersion() int {
 }
 
 func (s *Session) SetChannelID(channelID godave.ChannelID) {
+	// disgo calls this holding its connection lock, which a watchdog sending
+	// under sendMu may be waiting for, so it never waits for sendMu.
+	haveSendMu := s.sendMu.TryLock()
+	if haveSendMu {
+		defer s.sendMu.Unlock()
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	groupDeferred := s.channelID == 0 && len(s.externalSenderPackage) > 0
@@ -297,9 +311,30 @@ func (s *Session) SetChannelID(channelID godave.ChannelID) {
 	if !groupDeferred {
 		return
 	}
+	// A send here would run inside disgo's open(), before the connection is
+	// ready, so without a key package already sent the group is left to the
+	// next external sender package.
+	if !haveSendMu || len(s.pendingKeyPackage) == 0 {
+		s.logger.Debug("leaving mls group creation to the next external sender package",
+			"send_in_progress", !haveSendMu)
+
+		return
+	}
 	if err := s.createGroupWithExternalSenderLocked(); err != nil {
 		s.logger.Error("failed to create mls group with external sender", "error", err)
 	}
+}
+
+// lockMLS takes the locks held by everything that changes MLS state: the On*
+// handlers for their whole call, and the watchdogs for each step.
+func (s *Session) lockMLS() {
+	s.sendMu.Lock()
+	s.mu.Lock()
+}
+
+func (s *Session) unlockMLS() {
+	s.mu.Unlock()
+	s.sendMu.Unlock()
 }
 
 func (s *Session) AssignSsrcToCodec(ssrc uint32, codec godave.Codec) {
@@ -578,8 +613,8 @@ func (s *Session) RemoveUser(userID godave.UserID) {
 }
 
 func (s *Session) OnSelectProtocolAck(protocolVersion uint16) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	s.lockMLS()
+	defer s.unlockMLS()
 	s.protocolVersion = protocolVersion
 	s.transportOnly = protocolVersion == 0
 	if protocolVersion > 0 {
@@ -612,13 +647,14 @@ func (s *Session) OnSelectProtocolAck(protocolVersion uint16) {
 		s.mlsClient = nil
 		if err := s.ensurePendingKeyPackageLocked(); err != nil {
 			s.logger.Error("failed to prepare key package on protocol ack", "error", err)
+			s.watchDroppedSendLocked(err)
 		}
 	}
 }
 
 func (s *Session) OnDavePrepareTransition(transitionID uint16, protocolVersion uint16) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	s.lockMLS()
+	defer s.unlockMLS()
 	s.pendingTransitionID = transitionID
 	s.protocolVersion = protocolVersion
 
@@ -641,9 +677,11 @@ func (s *Session) OnDavePrepareTransition(transitionID uint16, protocolVersion u
 	if protocolVersion == 0 && s.callbacks != nil {
 		s.logger.Debug("downgrade to v0: sending ready_for_transition",
 			"transition_id", transitionID)
-		if err := s.retrySend(func() error {
+		if err := s.sendLocked(func() error {
 			return s.callbacks.SendReadyForTransition(transitionID)
 		}); err != nil {
+			// Not sendReadyForTransitionLocked: its recovery rebuilds the
+			// MLS state that v0 leaves behind.
 			s.logger.Error("failed to send ready_for_transition",
 				"transition_id", transitionID, "error", err)
 		}
@@ -651,8 +689,8 @@ func (s *Session) OnDavePrepareTransition(transitionID uint16, protocolVersion u
 }
 
 func (s *Session) OnDaveExecuteTransition(transitionID uint16) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	s.lockMLS()
+	defer s.unlockMLS()
 
 	s.logger.Debug("OnDaveExecuteTransition",
 		"transition_id", transitionID,
@@ -696,8 +734,8 @@ func (s *Session) OnDaveExecuteTransition(transitionID uint16) {
 }
 
 func (s *Session) OnDavePrepareEpoch(epoch int, protocolVersion uint16) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	s.lockMLS()
+	defer s.unlockMLS()
 
 	s.protocolVersion = protocolVersion
 	if epoch != 1 {
@@ -736,12 +774,13 @@ func (s *Session) OnDavePrepareEpoch(epoch int, protocolVersion uint16) {
 
 	if err := s.ensurePendingKeyPackageLocked(); err != nil {
 		s.logger.Error("failed to prepare key package", "error", err)
+		s.watchDroppedSendLocked(err)
 	}
 }
 
 func (s *Session) OnDaveMLSExternalSenderPackage(externalSenderPackage []byte) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	s.lockMLS()
+	defer s.unlockMLS()
 	s.externalSenderPackage = append([]byte(nil), externalSenderPackage...)
 	err := s.createGroupWithExternalSenderLocked()
 	if errors.Is(err, ErrNoChannelID) {
@@ -751,12 +790,13 @@ func (s *Session) OnDaveMLSExternalSenderPackage(externalSenderPackage []byte) {
 	}
 	if err != nil {
 		s.logger.Error("failed to create mls group with external sender", "error", err)
+		s.watchDroppedSendLocked(err)
 	}
 }
 
 func (s *Session) OnDaveMLSProposals(proposals []byte) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	s.lockMLS()
+	defer s.unlockMLS()
 	s.lastProposalBatch = append([]byte(nil), proposals...)
 	s.logger.Debug("OnDaveMLSProposals",
 		"size", len(proposals),
@@ -842,9 +882,7 @@ func (s *Session) reconcileCompetingCommitLocked(transitionID uint16, commitMess
 			"winning_commit_size", len(commitMessage))
 		if err := s.restorePreCommitStateLocked(); err != nil {
 			s.logger.Error("failed to restore pre-commit state", "transition_id", transitionID, "error", err)
-			if s.callbacks != nil {
-				_ = s.callbacks.SendInvalidCommitWelcome(transitionID)
-			}
+			s.sendInvalidCommitWelcomeLocked(transitionID)
 
 			return false
 		}
@@ -853,9 +891,7 @@ func (s *Session) reconcileCompetingCommitLocked(transitionID uint16, commitMess
 	if err := s.processCommitLocked(commitMessage); err != nil {
 		s.stats.CommitsFailed++
 		s.logger.Error("failed to process commit", "transition_id", transitionID, "error", err)
-		if s.callbacks != nil {
-			_ = s.callbacks.SendInvalidCommitWelcome(transitionID)
-		}
+		s.sendInvalidCommitWelcomeLocked(transitionID)
 		s.invalidateAndResendKeyPackageLocked()
 
 		return false
@@ -866,8 +902,8 @@ func (s *Session) reconcileCompetingCommitLocked(transitionID uint16, commitMess
 }
 
 func (s *Session) OnDaveMLSPrepareCommitTransition(transitionID uint16, commitMessage []byte) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	s.lockMLS()
+	defer s.unlockMLS()
 
 	s.logger.Debug("OnDaveMLSPrepareCommitTransition",
 		"transition_id", transitionID,
@@ -898,10 +934,8 @@ func (s *Session) OnDaveMLSPrepareCommitTransition(transitionID uint16, commitMe
 
 	// transition_id 0 is executed immediately and is not acknowledged; only send
 	// ready_for_transition for real (non-initial) transitions (matches golibdave).
-	if transitionID != 0 && s.callbacks != nil {
-		if err := s.retrySend(func() error { return s.callbacks.SendReadyForTransition(transitionID) }); err != nil {
-			s.logger.Error("failed to send ready for transition", "transition_id", transitionID, "error", err)
-		}
+	if transitionID != 0 {
+		s.sendReadyForTransitionLocked(transitionID)
 	}
 
 	if transitionID == 0 {
@@ -913,8 +947,8 @@ func (s *Session) OnDaveMLSPrepareCommitTransition(transitionID uint16, commitMe
 }
 
 func (s *Session) OnDaveMLSWelcome(transitionID uint16, welcomeMessage []byte) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	s.lockMLS()
+	defer s.unlockMLS()
 
 	s.logger.Debug("OnDaveMLSWelcome", "transition_id", transitionID, "welcome_size", len(welcomeMessage))
 	s.pendingTransitionID = transitionID
@@ -928,9 +962,7 @@ func (s *Session) OnDaveMLSWelcome(transitionID uint16, welcomeMessage []byte) {
 			"transition_id", transitionID)
 		if err := s.restorePreCommitStateLocked(); err != nil {
 			s.logger.Error("failed to restore pre-commit state on Welcome", "transition_id", transitionID, "error", err)
-			if s.callbacks != nil {
-				_ = s.callbacks.SendInvalidCommitWelcome(transitionID)
-			}
+			s.sendInvalidCommitWelcomeLocked(transitionID)
 
 			return
 		}
@@ -948,9 +980,7 @@ func (s *Session) OnDaveMLSWelcome(transitionID uint16, welcomeMessage []byte) {
 	if err := s.joinPendingWelcomeLocked(welcomeMessage); err != nil {
 		s.stats.WelcomesFailed++
 		s.logger.Error("failed to join welcome", "transition_id", transitionID, "error", err)
-		if s.callbacks != nil {
-			_ = s.callbacks.SendInvalidCommitWelcome(transitionID)
-		}
+		s.sendInvalidCommitWelcomeLocked(transitionID)
 		s.invalidateAndResendKeyPackageLocked()
 
 		return
@@ -968,10 +998,8 @@ func (s *Session) OnDaveMLSWelcome(transitionID uint16, welcomeMessage []byte) {
 
 	// transition_id 0 is executed immediately and is not acknowledged; only send
 	// ready_for_transition for real (non-initial) transitions (matches golibdave).
-	if transitionID != 0 && s.callbacks != nil {
-		if err := s.retrySend(func() error { return s.callbacks.SendReadyForTransition(transitionID) }); err != nil {
-			s.logger.Error("failed to send ready for transition", "transition_id", transitionID, "error", err)
-		}
+	if transitionID != 0 {
+		s.sendReadyForTransitionLocked(transitionID)
 	}
 
 	if transitionID == 0 {
