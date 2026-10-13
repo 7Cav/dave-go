@@ -132,7 +132,8 @@ type Session struct {
 	epochReady chan struct{}
 
 	// recoveryAttempts counts consecutive invalidate → new key package cycles
-	// without an activated epoch; bounded by maxRecoveryAttempts.
+	// without an activated epoch or a new connection; bounded by
+	// maxRecoveryAttempts.
 	recoveryAttempts int
 	recoveryTimeout  time.Duration
 
@@ -629,6 +630,7 @@ func (s *Session) OnSelectProtocolAck(protocolVersion uint16) {
 		s.pendingCommitBytes = nil
 		s.preCommitGroupState = nil
 		s.proposalQueue = nil
+		s.recoveryAttempts = 0
 		s.resetEpochReadyLocked()
 		// Keep the send ratchet (and counter) alive through the transition
 		// window (defensive padding, not spec-mandated — see retainedSendRatchet

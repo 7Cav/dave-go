@@ -199,6 +199,32 @@ func TestRecoveryWatchdog_BoundedWhileTransportDown(t *testing.T) {
 	}
 }
 
+// TestRecoveryWatchdog_NewConnectionGetsFreshAttempts verifies that a
+// select_protocol_ack after the attempts ran out lets a dropped send on the
+// new connection arm the watchdog again.
+func TestRecoveryWatchdog_NewConnectionGetsFreshAttempts(t *testing.T) {
+	cb := &shardNotReadyCallbacks{}
+	s := newRecoveryTestSession(t, cb)
+	eventually(t, func() bool {
+		invalid, _ := cb.counts()
+
+		return invalid == maxRecoveryAttempts
+	}, "recovery watchdog never exhausted its attempts")
+	time.Sleep(5 * s.recoveryTimeout)
+
+	s.OnSelectProtocolAck(1)
+
+	eventually(t, func() bool {
+		invalid, _ := cb.counts()
+
+		return invalid == 2*maxRecoveryAttempts
+	}, "the new connection got no recovery attempts")
+	time.Sleep(5 * s.recoveryTimeout)
+	if invalid, _ := cb.counts(); invalid != 2*maxRecoveryAttempts {
+		t.Fatalf("invalid_commit_welcome sent %d times, want %d", invalid, 2*maxRecoveryAttempts)
+	}
+}
+
 // TestRecoveryWatchdog_SupersededArmsCostNoAttempt verifies that dropped sends
 // re-arming the watchdog before it fires don't use up the attempts.
 func TestRecoveryWatchdog_SupersededArmsCostNoAttempt(t *testing.T) {
