@@ -53,3 +53,30 @@ func TestCommitRecovery_ArmsAfterSoleMemberActivation(t *testing.T) {
 		return invalidCommits > 0
 	}, "recovery watchdog should fire SendInvalidCommitWelcome after the timeout (was dead-on-arrival on a closed epochReady)")
 }
+
+// TestCommitRecovery_SkipsOnceReadyCloses verifies that a commit watchdog whose
+// timer fired while a handler held the locks does nothing once that handler
+// activated the epoch, even if a newer commit is pending by then.
+func TestCommitRecovery_SkipsOnceReadyCloses(t *testing.T) {
+	cb := &countingCallbacks{}
+	s, extPriv := setupActiveSoleMemberSessionWithKey(t)
+	s.callbacks = cb
+	s.recoveryTimeout = 50 * time.Millisecond
+	const joiner = "222222222"
+	s.AddUser(joiner)
+	s.OnDaveMLSProposals(buildProposalBatch(addProposalBytesForUser(t, s, extPriv, joiner)))
+
+	s.lockMLS()
+	if s.pendingEpoch == nil {
+		s.unlockMLS()
+		t.Fatal("session did not commit the proposal")
+	}
+	time.Sleep(5 * s.recoveryTimeout)
+	s.signalEpochReadyLocked()
+	s.unlockMLS()
+
+	time.Sleep(5 * s.recoveryTimeout)
+	if invalid, _ := cb.counts(); invalid != 0 {
+		t.Fatalf("stale commit watchdog sent invalid_commit_welcome %d times, want 0", invalid)
+	}
+}

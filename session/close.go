@@ -18,9 +18,10 @@ var _ io.Closer = (*Session)(nil)
 // It never fails; the error return exists to satisfy io.Closer and is
 // always nil.
 //
-// Forgetting to call Close is not a permanent leak — the recovery watchdog
-// re-arms at most maxRecoveryAttempts times, waiting recoveryTimeout per
-// attempt (3 × 15s ≈ 45s worst case), then exits on its own — but during
+// Forgetting to call Close is not a permanent leak — the watchdogs run
+// recovery at most maxRecoveryAttempts times, waiting recoveryTimeout per
+// attempt plus up to 12.5s of key package back-off while the gateway is down
+// (3 × 27.5s ≈ 83s worst case), then exits on its own — but during
 // that window the stale session keeps re-arming invalidations, polluting
 // logs and risking a "full voice reconnect required" on a channel the bot
 // no longer occupies.
@@ -41,9 +42,9 @@ func (s *Session) Close() error {
 // WaitShutdown blocks until every watchdog spawned before Close() has
 // exited, or ctx is done. Use this on orderly process shutdown if you need
 // a guarantee that no dave-go goroutine outlives the program. A watchdog
-// that is firing holds the session lock while it calls the callbacks, so
-// calling this from a callback, or while holding a lock the callbacks need,
-// can block until ctx is done.
+// that is sending holds the session's send lock while it calls the
+// callbacks, so calling this from a callback, or while holding a lock the
+// callbacks need, can block until ctx is done.
 func (s *Session) WaitShutdown(ctx context.Context) error {
 	select {
 	case <-s.shutdownDone:

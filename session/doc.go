@@ -32,7 +32,8 @@
 //	call Session.Close() when the session is discarded (channel move, voice
 //	disconnect) so the internal recovery/commit watchdogs exit promptly.
 //	The watchdogs are time-bounded (at most maxRecoveryAttempts retries of
-//	recoveryTimeout each, ~45s worst case), so a missed Close is not a
+//	recoveryTimeout each, plus the key package back-off while the gateway is
+//	down, ~83s worst case), so a missed Close is not a
 //	permanent leak — but until they expire the old session can keep re-arming
 //	invalidations on a channel the bot no longer occupies. Close satisfies
 //	io.Closer, so a voice layer holding only the godave.Session can tear

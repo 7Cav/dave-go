@@ -192,32 +192,26 @@ func TestStats_RecoveryAttemptsNotTransportOnMLSFault(t *testing.T) {
 }
 
 // TestStats_RecoveryAttemptsTransportIncrementsOnShardNotReady covers the
-// real scenario RecoveryAttemptsTransport exists for: invalidateAndResendKeyPackageLocked
-// bails out on a transport failure (shardNotReadyCallbacks, shared with
-// recovery_test.go) instead of arming the watchdog. Complements
-// TestInvalidation_NoWatchdogOnShardNotReady (which checks the watchdog does
-// NOT fire) by asserting the counter that lets an integrator observe this
-// happened at all.
+// real scenario RecoveryAttemptsTransport exists for: the key package
+// invalidateAndResendKeyPackageLocked sends is dropped while the gateway is
+// down (shardNotReadyCallbacks, shared with recovery_test.go), and the recovery
+// watchdog it arms counts as a transport recovery as well as a recovery.
 func TestStats_RecoveryAttemptsTransportIncrementsOnShardNotReady(t *testing.T) {
 	cb := &shardNotReadyCallbacks{}
 	s := newRecoveryTestSession(t, cb)
 
-	s.mu.Lock()
-	before := s.stats.RecoveryAttemptsTransport
+	s.lockMLS()
+	before := s.stats
 	s.invalidateAndResendKeyPackageLocked()
-	after := s.stats.RecoveryAttemptsTransport
-	s.mu.Unlock()
+	after := s.stats
+	s.unlockMLS()
 
-	if after != before+1 {
-		t.Fatalf("RecoveryAttemptsTransport = %d after shard-not-ready invalidation, want %d", after, before+1)
+	if after.RecoveryAttemptsTransport != before.RecoveryAttemptsTransport+1 {
+		t.Fatalf("RecoveryAttemptsTransport = %d after shard-not-ready invalidation, want %d",
+			after.RecoveryAttemptsTransport, before.RecoveryAttemptsTransport+1)
 	}
-
-	// The MLS-fault counter must stay untouched: this was a transport skip,
-	// not an armed recovery watchdog.
-	s.mu.Lock()
-	mlsAttempts := s.stats.RecoveryAttempts
-	s.mu.Unlock()
-	if mlsAttempts != 0 {
-		t.Fatalf("RecoveryAttempts = %d, want 0 (this path never arms the MLS watchdog)", mlsAttempts)
+	if after.RecoveryAttempts != before.RecoveryAttempts+1 {
+		t.Fatalf("RecoveryAttempts = %d after shard-not-ready invalidation, want %d",
+			after.RecoveryAttempts, before.RecoveryAttempts+1)
 	}
 }

@@ -1,8 +1,10 @@
 package session
 
 import (
+	"context"
 	"errors"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -70,9 +72,9 @@ func TestRecoveryWatchdogRetriesThenGivesUp(t *testing.T) {
 	cb := &countingCallbacks{}
 	s := newRecoveryTestSession(t, cb)
 
-	s.mu.Lock()
+	s.lockMLS()
 	s.invalidateAndResendKeyPackageLocked()
-	s.mu.Unlock()
+	s.unlockMLS()
 
 	// Each timed-out attempt re-signals InvalidCommitWelcome and re-invalidates;
 	// after maxRecoveryAttempts the watchdog must stop re-arming.
@@ -104,12 +106,12 @@ func TestRecoveryWatchdogStopsWhenEpochActivates(t *testing.T) {
 	cb := &countingCallbacks{}
 	s := newRecoveryTestSession(t, cb)
 
-	s.mu.Lock()
+	s.lockMLS()
 	s.invalidateAndResendKeyPackageLocked()
 	// Simulate the epoch activating right after the invalidation.
 	s.recoveryAttempts = 0
 	s.signalEpochReadyLocked()
-	s.mu.Unlock()
+	s.unlockMLS()
 
 	time.Sleep(5 * s.recoveryTimeout)
 	invalid, _ := cb.counts()
@@ -118,70 +120,181 @@ func TestRecoveryWatchdogStopsWhenEpochActivates(t *testing.T) {
 	}
 }
 
-// shardNotReadyCallbacks simulates a voice gateway that is transiently
-// down: every SendMLSKeyPackage returns "shard is not ready" so retrySend
-// exhausts its attempts. Used to verify that invalidateAndResendKeyPackageLocked
-// does NOT arm the recovery watchdog in that case (the gateway reconnect
-// will deliver OnSelectProtocolAck to reset the session cleanly).
+// shardNotReadyCallbacks simulates a voice gateway that is down: every send
+// returns "shard is not ready" until reconnect is called. It counts the key
+// packages and invalid_commit_welcome messages the session tried to send.
 type shardNotReadyCallbacks struct {
-	mu             sync.Mutex
-	invalidCommits int
-	keyPackages    int
+	countingCallbacks
+	up       atomic.Bool
+	distinct sync.Map
 }
 
-func (c *shardNotReadyCallbacks) SendMLSKeyPackage(_ []byte) error {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	c.keyPackages++
+func (c *shardNotReadyCallbacks) transportErr() error {
+	if c.up.Load() {
+		return nil
+	}
 
 	return errors.New("shard is not ready")
 }
 
-func (c *shardNotReadyCallbacks) SendMLSCommitWelcome(_ []byte) error   { return nil }
-func (c *shardNotReadyCallbacks) SendReadyForTransition(_ uint16) error { return nil }
-func (c *shardNotReadyCallbacks) SendInvalidCommitWelcome(_ uint16) error {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	c.invalidCommits++
+func (c *shardNotReadyCallbacks) SendMLSKeyPackage(kp []byte) error {
+	_ = c.countingCallbacks.SendMLSKeyPackage(kp)
+	c.distinct.Store(string(kp), struct{}{})
 
-	return nil
+	return c.transportErr()
 }
 
-func (c *shardNotReadyCallbacks) counts() (invalidCommits, keyPackages int) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
+func (c *shardNotReadyCallbacks) SendInvalidCommitWelcome(transitionID uint16) error {
+	_ = c.countingCallbacks.SendInvalidCommitWelcome(transitionID)
 
-	return c.invalidCommits, c.keyPackages
+	return c.transportErr()
 }
 
-// TestInvalidation_NoWatchdogOnShardNotReady
-// when the re-send of the key package after an invalidation fails because
-// the gateway is down, the recovery watchdog must NOT be armed. Re-arming
-// it would just loop on a transport problem (and the new key package cannot
-// leave either). The natural OnSelectProtocolAck on gateway reconnect resets
-// the session.
-func TestInvalidation_NoWatchdogOnShardNotReady(t *testing.T) {
+func (c *shardNotReadyCallbacks) distinctKeyPackages() int {
+	n := 0
+	c.distinct.Range(func(any, any) bool {
+		n++
+
+		return true
+	})
+
+	return n
+}
+
+func (c *shardNotReadyCallbacks) reconnect() {
+	c.up.Store(true)
+}
+
+// TestRecoveryWatchdog_BoundedWhileTransportDown verifies that a session whose
+// gateway never comes back stops trying: the dropped key package arms the
+// recovery watchdog, each firing retries the key package with back-off and
+// re-arms, and after maxRecoveryAttempts firings it gives up.
+func TestRecoveryWatchdog_BoundedWhileTransportDown(t *testing.T) {
 	cb := &shardNotReadyCallbacks{}
 	s := newRecoveryTestSession(t, cb)
 
-	s.mu.Lock()
-	s.invalidateAndResendKeyPackageLocked()
-	s.mu.Unlock()
+	eventually(t, func() bool {
+		invalid, _ := cb.counts()
 
-	// Sleep well past the recovery timeout. With the fix the watchdog is
-	// never armed, so invalidCommits stays 0. Without the fix, the watchdog
-	// would re-fire maxRecoveryAttempts times.
+		return invalid == maxRecoveryAttempts
+	}, "recovery watchdog never exhausted its attempts")
+
 	time.Sleep(5 * s.recoveryTimeout)
-
-	invalid, _ := cb.counts()
-	if invalid != 0 {
-		t.Fatalf("recovery watchdog fired despite transport failure: %d invalid commits", invalid)
+	invalid, keyPackages := cb.counts()
+	if invalid != maxRecoveryAttempts {
+		t.Fatalf("invalid_commit_welcome sent %d times, want %d", invalid, maxRecoveryAttempts)
 	}
+	// One from select_protocol_ack, then a full back-off per firing.
+	if want := 1 + maxRecoveryAttempts*s.retry.maxAttempts; keyPackages != want {
+		t.Fatalf("key package sent %d times, want %d", keyPackages, want)
+	}
+	// Each firing retries the same key package.
+	if got, want := cb.distinctKeyPackages(), 1+maxRecoveryAttempts; got != want {
+		t.Fatalf("%d distinct key packages, want %d", got, want)
+	}
+	stats := s.Stats()
+	if stats.RecoveryAttempts != maxRecoveryAttempts || stats.RecoveryAttemptsTransport != maxRecoveryAttempts {
+		t.Fatalf("RecoveryAttempts = %d, RecoveryAttemptsTransport = %d, want %d each",
+			stats.RecoveryAttempts, stats.RecoveryAttemptsTransport, maxRecoveryAttempts)
+	}
+}
 
-	// Sanity check: at least one SendMLSKeyPackage was attempted (and failed).
-	// The gateway would have received it in the working case.
-	_, kp := cb.counts()
-	if kp == 0 {
-		t.Fatal("expected ensurePendingKeyPackageLocked to attempt at least one SendMLSKeyPackage")
+// TestRecoveryWatchdog_SupersededArmsCostNoAttempt verifies that dropped sends
+// re-arming the watchdog before it fires don't use up the attempts.
+func TestRecoveryWatchdog_SupersededArmsCostNoAttempt(t *testing.T) {
+	cb := &shardNotReadyCallbacks{}
+	s := newRecoveryTestSession(t, cb)
+	s.OnDavePrepareEpoch(1, 1)
+	s.OnDavePrepareEpoch(1, 1)
+
+	eventually(t, func() bool {
+		invalid, _ := cb.counts()
+
+		return invalid == maxRecoveryAttempts
+	}, "recovery watchdog gave up before using its attempts")
+}
+
+// TestRecoveryWatchdog_GivesWayToReconnect verifies that a watchdog backing off
+// while the gateway is down neither delays a handler nor sends anything once a
+// new connection's select_protocol_ack has reset the session.
+func TestRecoveryWatchdog_GivesWayToReconnect(t *testing.T) {
+	cb := &shardNotReadyCallbacks{}
+	s := New("123456789", cb)
+	closeAtCleanup(t, s)
+	s.recoveryTimeout = 10 * time.Millisecond
+	s.retry.delay = time.Hour
+	s.OnSelectProtocolAck(1)
+
+	// The watchdog has fired and is waiting out its first back-off.
+	eventually(t, func() bool {
+		invalid, keyPackages := cb.counts()
+
+		return invalid == 1 && keyPackages == 2
+	}, "recovery watchdog never retried the key package")
+
+	cb.reconnect()
+	within(t, "OnSelectProtocolAck during the watchdog's back-off", func() { s.OnSelectProtocolAck(1) })
+
+	eventually(t, func() bool {
+		return s.Stats().TransportRetryDuration > 0
+	}, "watchdog kept backing off after the reset")
+	invalid, keyPackages := cb.counts()
+	if invalid != 1 || keyPackages != 3 {
+		t.Fatalf("after reconnect: %d invalid_commit_welcome, %d key packages; want 1 and 3", invalid, keyPackages)
+	}
+	if got := s.Stats().RecoveryAttempts; got != 1 {
+		t.Fatalf("RecoveryAttempts = %d, want 1 (the superseded watchdog must not re-arm)", got)
+	}
+}
+
+// readyDroppingCallbacks fails every ready_for_transition send.
+type readyDroppingCallbacks struct {
+	kpCapturingCallbacks
+}
+
+func (c *readyDroppingCallbacks) SendReadyForTransition(uint16) error {
+	return errors.New("shard is not ready")
+}
+
+// TestReadyForTransitionDropped_ArmsRecoveryWithoutActiveEpoch verifies that a
+// dropped ready_for_transition arms the recovery watchdog only when no older
+// epoch is active, since recovery would reset a session that still encrypts.
+func TestReadyForTransitionDropped_ArmsRecoveryWithoutActiveEpoch(t *testing.T) {
+	tests := []struct {
+		name                string
+		welcomeTransitionID uint16
+		peerCommit          bool
+		wantArmed           bool
+	}{
+		{name: "no active epoch", welcomeTransitionID: 5, wantArmed: true},
+		{name: "older epoch active", peerCommit: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cb := &readyDroppingCallbacks{}
+			s := New("123456789", cb)
+			closeAtCleanup(t, s)
+			s.SetChannelID(987654321)
+			s.OnSelectProtocolAck(1)
+			externalSenderPackage := buildExternalSenderPackage(t)
+			setExternalSenderPackage(t, s, externalSenderPackage)
+			peer, groupID, welcome := newPeerGroupForExternalSender(t, cb.lastKeyPackage(), externalSenderPackage)
+			s.OnDaveMLSWelcome(tt.welcomeTransitionID, welcome)
+			if tt.peerCommit {
+				commit, _, err := peer.CommitPendingProposals(context.Background(), groupID)
+				if err != nil {
+					t.Fatalf("peer.CommitPendingProposals: %v", err)
+				}
+				s.OnDaveMLSPrepareCommitTransition(tt.welcomeTransitionID+1, commit)
+			}
+
+			stats := s.Stats()
+			if stats.WelcomesJoined != 1 || tt.peerCommit && stats.CommitsProcessed != 1 {
+				t.Fatalf("WelcomesJoined = %d, CommitsProcessed = %d", stats.WelcomesJoined, stats.CommitsProcessed)
+			}
+			if armed := stats.RecoveryAttemptsTransport > 0; armed != tt.wantArmed {
+				t.Fatalf("recovery armed = %v, want %v", armed, tt.wantArmed)
+			}
+		})
 	}
 }

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"strconv"
 	"time"
@@ -125,19 +126,37 @@ func (s *Session) ensurePendingKeyPackageLocked() error {
 	if len(s.pendingKeyPackage) > 0 {
 		return nil
 	}
+	kp, err := s.freshKeyPackageLocked()
+	if err != nil {
+		return err
+	}
 
+	return s.sendKeyPackageLocked(kp)
+}
+
+func (s *Session) freshKeyPackageLocked() ([]byte, error) {
+	if err := s.ensureMLSClientLocked(); err != nil {
+		return nil, err
+	}
 	// DAVE spec (https://daveprotocol.com/#validation) requires lifetime [0, 2^64-1].
 	kp, err := s.mlsClient.client.FreshKeyPackageBytes(
 		context.Background(),
 		keypackages.InfiniteLifetime(),
 	)
 	if err != nil {
-		return fmt.Errorf("generate fresh key package: %w", err)
+		return nil, fmt.Errorf("generate fresh key package: %w", err)
 	}
 
+	return kp, nil
+}
+
+func (s *Session) sendKeyPackageLocked(kp []byte) error {
+	if len(s.pendingKeyPackage) > 0 {
+		return nil
+	}
 	if s.callbacks != nil {
 		// libdave sends the marshaled KeyPackage directly for opcode 26.
-		if err := s.retrySend(func() error { return s.callbacks.SendMLSKeyPackage(kp) }); err != nil {
+		if err := s.sendLocked(func() error { return s.callbacks.SendMLSKeyPackage(kp) }); err != nil {
 			return fmt.Errorf("send mls key package: %w", err)
 		}
 	}
@@ -671,6 +690,7 @@ func (s *Session) activateSoleMemberEpochLocked() {
 		}
 		if err := s.createGroupWithExternalSenderLocked(); err != nil {
 			s.logger.Error("sole member reset: failed to recreate local group", "error", err)
+			s.watchDroppedSendLocked(err)
 
 			return
 		}
@@ -870,13 +890,20 @@ func (s *Session) restorePreCommitStateLocked() error {
 // the client must locally reset MLS state and generate a new key package so
 // the voice gateway can re-add the member via a fresh add proposal.
 //
-// If the re-send of the key package fails because the voice gateway is
-// transiently down ("shard is not ready"), the recovery watchdog is NOT
-// armed — re-arming it would just loop on a transport problem, and the new
-// key package cannot leave either. The cleanest path is to wait for the
-// gateway to reconnect, which triggers a fresh OnSelectProtocolAck that
-// resets the session from scratch. Must be called with s.mu held.
+// The recovery watchdog is armed even if the key package is dropped, for the
+// reason given on watchDroppedSendLocked. maxRecoveryAttempts bounds the
+// attempts while the gateway stays down. Must be called with sendMu and s.mu
+// held.
 func (s *Session) invalidateAndResendKeyPackageLocked() {
+	s.invalidateMLSStateLocked()
+	err := s.ensurePendingKeyPackageLocked()
+	if err != nil {
+		s.logger.Error("failed to send new key package after invalid commit/welcome", "error", err)
+	}
+	s.watchRecoveryLocked(err)
+}
+
+func (s *Session) invalidateMLSStateLocked() {
 	s.mlsClient = nil
 	s.groupID = nil
 	s.pendingGroupID = nil
@@ -889,21 +916,41 @@ func (s *Session) invalidateAndResendKeyPackageLocked() {
 	// Fresh channel so the recovery watchdog waits for an epoch activated
 	// AFTER this invalidation, not one that was already active before.
 	s.resetEpochReadyLocked()
-	if err := s.ensurePendingKeyPackageLocked(); err != nil {
-		if isShardNotReady(err) {
-			s.stats.RecoveryAttemptsTransport++
-			s.logger.Warn(
-				"key package re-send skipped: shard not ready (transport down). "+
-					"Waiting for OnSelectProtocolAck to reset the session on reconnect.",
-				"error", err,
-			)
-			// No recovery watchdog: the gateway reconnect will deliver
-			// OnSelectProtocolAck, which clears all MLS state.
-			return
-		}
-		s.logger.Error("failed to send new key package after invalid commit/welcome", "error", err)
+}
+
+// watchDroppedSendLocked arms the recovery watchdog when err is a send the
+// voice gateway never got. A resumed connection brings no OnSelectProtocolAck
+// to reset the session, so nothing else would recover it. Must be called with
+// sendMu and s.mu held.
+func (s *Session) watchDroppedSendLocked(err error) {
+	if !errors.Is(err, errSendFailed) {
+		return
 	}
-	s.watchRecoveryLocked()
+	s.resetEpochReadyLocked()
+	s.watchRecoveryLocked(err)
+}
+
+func (s *Session) sendInvalidCommitWelcomeLocked(transitionID uint16) {
+	if s.callbacks == nil {
+		return
+	}
+	_ = s.sendLocked(func() error { return s.callbacks.SendInvalidCommitWelcome(transitionID) })
+}
+
+func (s *Session) sendReadyForTransitionLocked(transitionID uint16) {
+	if s.callbacks == nil {
+		return
+	}
+	err := s.sendLocked(func() error { return s.callbacks.SendReadyForTransition(transitionID) })
+	if err == nil {
+		return
+	}
+	s.logger.Error("failed to send ready for transition", "transition_id", transitionID, "error", err)
+	// Recovery would reset a session that still encrypts with its active
+	// epoch, so then the drop is only logged.
+	if s.activeEpoch == nil {
+		s.watchDroppedSendLocked(err)
+	}
 }
 
 // watchRecoveryLocked supervises recovery after an MLS state invalidation.
@@ -911,20 +958,22 @@ func (s *Session) invalidateAndResendKeyPackageLocked() {
 // send a new key package; if that never happens the session is stuck without
 // an active epoch and every Encrypt fails (audio goes silent forever).
 // Retry the invalid-commit signal a bounded number of times, then surface
-// the failure. Must be called with s.mu held.
-func (s *Session) watchRecoveryLocked() {
+// the failure. sendErr is the failed send that led here, if any. The caller
+// must reset epochReady first and hold s.mu.
+func (s *Session) watchRecoveryLocked(sendErr error) {
 	if s.recoveryAttempts >= maxRecoveryAttempts {
 		s.logger.Error("session did not recover after repeated invalidations; a full voice reconnect is required",
 			"attempts", s.recoveryAttempts)
 
 		return
 	}
-	s.recoveryAttempts++
 	s.stats.RecoveryAttempts++
+	if errors.Is(sendErr, errSendFailed) {
+		s.stats.RecoveryAttemptsTransport++
+	}
 
 	ready := s.epochReady
 	transitionID := s.pendingTransitionID
-	attempt := s.recoveryAttempts
 	timeout := s.recoveryTimeout
 	s.goWatchdog(func() {
 		select {
@@ -936,24 +985,44 @@ func (s *Session) watchRecoveryLocked() {
 			return
 		case <-time.After(timeout):
 		}
-		s.mu.Lock()
-		defer s.mu.Unlock()
-		if s.shutdownCtx.Err() != nil {
-			return
-		}
-		select {
-		case <-ready:
-			// Activated while we were acquiring the lock.
-			return
-		default:
-		}
-		s.logger.Warn("no epoch activated after invalidation, retrying recovery",
-			"attempt", attempt, "transition_id", transitionID)
-		if s.callbacks != nil {
-			_ = s.callbacks.SendInvalidCommitWelcome(transitionID)
-		}
-		s.invalidateAndResendKeyPackageLocked()
+		s.recoverAfterTimeout(transitionID, ready, nil, "no epoch activated after invalidation, retrying recovery")
 	})
+}
+
+// recoverAfterTimeout runs recovery for a watchdog whose wait on ready timed
+// out, unless the session, ready or needed says it is no longer wanted.
+// Counting the attempt here rather than when the watchdog is armed means a
+// watchdog superseded before it fires costs no attempt.
+func (s *Session) recoverAfterTimeout(transitionID uint16, ready <-chan struct{}, needed func() bool, msg string) {
+	s.lockMLS()
+	if s.shutdownCtx.Err() != nil || isClosed(ready) || (needed != nil && !needed()) {
+		s.unlockMLS()
+
+		return
+	}
+	s.recoveryAttempts++
+	s.logger.Warn(msg, "transition_id", transitionID, "attempt", s.recoveryAttempts)
+	s.sendInvalidCommitWelcomeLocked(transitionID)
+	s.invalidateMLSStateLocked()
+	next := s.epochReady
+	kp, err := s.freshKeyPackageLocked()
+	s.unlockMLS()
+
+	if err == nil {
+		// Any reset of the MLS client closes ready, so kp stays valid for
+		// every attempt that retrySend lets through.
+		err = s.retrySend(next, func() error { return s.sendKeyPackageLocked(kp) })
+	}
+
+	s.lockMLS()
+	defer s.unlockMLS()
+	if s.shutdownCtx.Err() != nil || isClosed(next) {
+		return
+	}
+	if err != nil {
+		s.logger.Error("failed to send new key package after invalid commit/welcome", "error", err)
+	}
+	s.watchRecoveryLocked(err)
 }
 
 func (s *Session) commitProposalsLocked() error {
@@ -1033,24 +1102,16 @@ func (s *Session) commitProposalsLocked() error {
 		return nil
 	}
 	s.logger.Debug("commitProposalsLocked: sending commit/welcome to gateway", "payload_size", len(payload))
-	if err := s.retrySend(func() error { return s.callbacks.SendMLSCommitWelcome(payload) }); err != nil {
-		if isShardNotReady(err) {
-			// Transport down: roll back the local commit so the in-memory MLS
-			// state stays consistent with the gateway (which never got our commit).
-			// OnSelectProtocolAck on reconnect will reset everything cleanly.
-			if rbErr := s.restorePreCommitStateLocked(); rbErr != nil {
-				s.logger.Error("commitProposalsLocked: rollback after transport failure failed", "error", rbErr)
-			}
-			s.logger.Warn(
-				"commit send skipped: shard not ready (transport down). "+
-					"Rolled back local MLS state; waiting for OnSelectProtocolAck on reconnect.",
-				"error", err,
-			)
-
-			return nil
+	if err := s.sendLocked(func() error { return s.callbacks.SendMLSCommitWelcome(payload) }); err != nil {
+		// Roll back the local commit so the in-memory MLS state stays
+		// consistent with the gateway, which never got it.
+		if rbErr := s.restorePreCommitStateLocked(); rbErr != nil {
+			s.logger.Error("commitProposalsLocked: rollback after transport failure failed", "error", rbErr)
 		}
+		s.logger.Warn("commit not sent; rolled back local MLS state", "error", err)
+		s.watchDroppedSendLocked(err)
 
-		return err
+		return nil
 	}
 
 	// Start a background recovery goroutine. If Discord does not confirm our
@@ -1080,19 +1141,8 @@ func (s *Session) commitProposalsLocked() error {
 			return
 		case <-time.After(timeout):
 		}
-		s.mu.Lock()
-		defer s.mu.Unlock()
-		if s.shutdownCtx.Err() != nil {
-			return
-		}
-		if s.pendingEpoch == nil {
-			return
-		}
-		s.logger.Warn("commit not confirmed by Discord, triggering recovery", "transition_id", transitionID)
-		if s.callbacks != nil {
-			_ = s.callbacks.SendInvalidCommitWelcome(transitionID)
-		}
-		s.invalidateAndResendKeyPackageLocked()
+		s.recoverAfterTimeout(transitionID, ready, func() bool { return s.pendingEpoch != nil },
+			"commit not confirmed by Discord, triggering recovery")
 	})
 
 	return nil
