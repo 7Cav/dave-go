@@ -657,6 +657,15 @@ func (s *Session) OnSelectProtocolAck(protocolVersion uint16) {
 func (s *Session) OnDavePrepareTransition(transitionID uint16, protocolVersion uint16) {
 	s.lockMLS()
 	defer s.unlockMLS()
+	// The gateway sends transition 0 only after a reset, which clears the
+	// active epoch. Rebuilding an active epoch would restart its send nonces
+	// under the same key and reopen its replay windows.
+	if transitionID == 0 && s.activeEpoch != nil {
+		s.logger.Warn("ignoring prepare_transition(0) while an epoch is active",
+			"epoch_id", s.activeEpoch.id)
+
+		return
+	}
 	s.pendingTransitionID = transitionID
 	s.protocolVersion = protocolVersion
 
