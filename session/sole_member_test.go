@@ -9,6 +9,7 @@ import (
 	"log/slog"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/disgoorg/godave"
 	"github.com/thomas-vilte/dave-go/frame"
@@ -280,4 +281,66 @@ func assertGroupAfterNextExternalSender(t *testing.T, s *Session, externalSender
 	if len(s.groupID) == 0 {
 		t.Fatal("next external sender package did not create the group")
 	}
+}
+
+func TestSoleMemberTransition_IgnoredWhileEpochActive(t *testing.T) {
+	const ssrc = 42
+	t.Run("send nonce not reused", func(t *testing.T) {
+		s, _ := setupActiveSoleMemberSessionWithKey(t)
+		s.AssignSsrcToCodec(ssrc, godave.CodecOpus)
+		s.sendRetentionTTL = 50 * time.Millisecond
+		p1 := bytes.Repeat([]byte{0x5a}, 32)
+		p2 := bytes.Repeat([]byte{0xa5}, 32)
+
+		c1 := encryptFrame(t, s, ssrc, p1)
+		s.OnDavePrepareTransition(0, 1)
+		time.Sleep(2 * s.sendRetentionTTL)
+		c2 := encryptFrame(t, s, ssrc, p2)
+
+		for i := range p1 {
+			if c1[i]^c2[i] != p1[i]^p2[i] {
+				return
+			}
+		}
+		t.Fatal("two frames were encrypted with the same key and nonce")
+	})
+	t.Run("replay window not reopened", func(t *testing.T) {
+		s, _ := setupActiveSoleMemberSessionWithKey(t)
+		s.AssignSsrcToCodec(ssrc, godave.CodecOpus)
+		f := encryptFrame(t, s, ssrc, []byte("own frame"))
+		buf := make([]byte, len(f))
+		if _, err := s.Decrypt(s.userID, f, buf); err != nil {
+			t.Fatalf("first decrypt: %v", err)
+		}
+
+		s.OnDavePrepareTransition(0, 1)
+
+		if _, err := s.Decrypt(s.userID, f, buf); err == nil {
+			t.Fatal("replayed frame accepted after prepare_transition(0)")
+		}
+	})
+	t.Run("pending transition kept", func(t *testing.T) {
+		s, _ := setupActiveSoleMemberSessionWithKey(t)
+		const transitionID = 5
+		s.OnDavePrepareTransition(transitionID, 1)
+
+		s.OnDavePrepareTransition(0, 1)
+
+		s.mu.RLock()
+		defer s.mu.RUnlock()
+		if s.pendingTransitionID != transitionID {
+			t.Fatalf("pendingTransitionID = %d, want %d", s.pendingTransitionID, transitionID)
+		}
+	})
+}
+
+func encryptFrame(t *testing.T, s *Session, ssrc uint32, plaintext []byte) []byte {
+	t.Helper()
+	out := make([]byte, s.MaxEncryptedFrameSize(len(plaintext)))
+	n, err := s.Encrypt(ssrc, plaintext, out)
+	if err != nil {
+		t.Fatalf("Encrypt: %v", err)
+	}
+
+	return out[:n]
 }
