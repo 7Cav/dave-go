@@ -116,16 +116,19 @@ type Session struct {
 	pendingKeyPackage     []byte
 	lastProposalBatch     []byte
 
-	// proposalQueue holds proposal batches received while a pendingEpoch is
-	// waiting for ExecuteTransition. They are replayed in order once the
-	// pending epoch is activated, preventing intermediate epoch states from
-	// being lost when Discord DS sends multiple proposal batches in quick
-	// succession before confirming the previous transition.
+	// proposalQueue holds proposal batches received while a pendingEpoch that
+	// is not from our unconfirmed commit is waiting for ExecuteTransition.
+	// They are replayed in order once the pending epoch is activated,
+	// preventing intermediate epoch states from being lost when Discord DS
+	// sends multiple proposal batches in quick succession before confirming
+	// the previous transition.
 	proposalQueue [][]byte
 
 	// pendingCommitBytes is the raw commit we sent to Discord DS (op28).
 	// If op29 arrives with a DIFFERENT commit (another client's commit won),
 	// we restore preCommitState, clear pendingEpoch, and process the winner.
+	// A proposal batch that arrives before op29 also restores preCommitState,
+	// and we commit again over every cached proposal.
 	pendingCommitBytes  []byte
 	preCommitGroupState []byte
 
@@ -814,10 +817,35 @@ func (s *Session) OnDaveMLSProposals(proposals []byte) {
 		"group_id", fmt.Sprintf("%x", s.groupID),
 		"has_group", len(s.groupID) > 0)
 
-	// If a pendingEpoch is already waiting for ExecuteTransition, queue this
-	// batch instead of committing immediately. Committing again would advance
-	// the local group state past what Discord DS has accepted, causing the
-	// intermediate epoch to be overwritten and audio keys to diverge.
+	s.handleProposalBatchLocked(proposals)
+}
+
+// handleProposalBatchLocked takes in a proposal batch and commits every cached
+// proposal, or queues the batch behind a pending epoch the session can't
+// commit over. Must be called with sendMu and s.mu held.
+func (s *Session) handleProposalBatchLocked(proposals []byte) {
+	if len(s.pendingCommitBytes) > 0 {
+		// Our commit waits for op 29. The gateway only broadcasts a commit that
+		// references every proposal it broadcast in the epoch (protocol.md
+		// "Voice Gateway Commit Validity"), so after this batch our commit
+		// can't win. Roll the group back to before the commit. Its cache still
+		// holds the commit's proposals, so the next commit covers them and this
+		// batch, as libdave's would, and a peer's commit over every batch can
+		// be processed too.
+		err := s.restorePreCommitStateLocked()
+		if err == nil {
+			s.logger.Info("committing again over a proposal batch that arrived while our commit waited",
+				"size", len(proposals))
+			s.processAndCommitProposalBatchLocked(proposals)
+
+			return
+		}
+		s.logger.Error("failed to roll back our commit for a new proposal batch", "error", err)
+	}
+
+	// A pending epoch from a peer's commit, a Welcome, or our commit after op 29
+	// confirmed it is the group the gateway moved to. The batch waits for that
+	// epoch to activate, and so does a batch whose rollback failed.
 	if s.pendingEpoch != nil {
 		s.logger.Debug("OnDaveMLSProposals: pendingEpoch in flight, queuing proposals", "queue_len", len(s.proposalQueue)+1)
 		s.proposalQueue = append(s.proposalQueue, append([]byte(nil), proposals...))
@@ -828,36 +856,36 @@ func (s *Session) OnDaveMLSProposals(proposals []byte) {
 	s.processAndCommitProposalBatchLocked(proposals)
 }
 
-// processAndCommitProposalBatchLocked processes a proposal batch and commits.
-// Must be called with s.mu held.
+// processAndCommitProposalBatchLocked processes a proposal batch and commits
+// every proposal the group then holds. Must be called with s.mu held.
 func (s *Session) processAndCommitProposalBatchLocked(proposals []byte) {
 	if err := s.ensureMLSClientLocked(); err != nil {
 		s.logger.Error("failed to init mls client", "error", err)
 
 		return
 	}
-	acceptedAny, err := s.processProposalBatchLocked(proposals)
-	if err != nil {
+	if err := s.processProposalBatchLocked(proposals); err != nil {
+		// Proposals taken in before the failure stay cached, and the commit
+		// below covers them.
 		s.logger.Error("failed to process proposals", "error", err, "size", len(proposals))
-
-		return
 	}
 	if len(s.groupID) == 0 {
 		s.logger.Warn("no MLS group after processing proposals, skipping commit")
 
 		return
 	}
-	// DAVE revoke (operation_type=1) solo quita proposals cacheados; la spec
-	// manda commitear "if there are one or more cached proposals after
-	// processing" (protocol.md:176) — un revoke puro no deja proposals nuevos.
-	if len(proposals) > 0 && proposals[0] == 1 {
-		s.logger.Info("mls revoke processed, no commit needed",
-			"size", len(proposals))
+	// The spec asks for a commit "if there are one or more cached proposals
+	// after processing" (protocol.md:176). A revoke, or a batch whose
+	// proposals were all refused, leaves some when a rollback brought back the
+	// proposals of our earlier commit.
+	cached, err := s.cachedProposalCountLocked()
+	if err != nil {
+		s.logger.Error("failed to read cached proposals", "error", err)
 
 		return
 	}
-	if !acceptedAny {
-		s.logger.Info("mls proposals processed without accepted append proposals, skipping commit",
+	if cached == 0 {
+		s.logger.Info("no cached mls proposals after processing, skipping commit",
 			"size", len(proposals))
 
 		return

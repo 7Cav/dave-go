@@ -216,50 +216,28 @@ func TestOnDaveMLSWelcome_OverPeerPendingEpoch(t *testing.T) {
 }
 
 // TestOnDaveMLSWelcome_AfterOwnCommit verifies that a Welcome after our own
-// commit rolls the commit back, drops the queued proposals and joins.
+// commit, made again over a batch that came while the first one waited,
+// rolls the commit back and joins the group the others are in.
 func TestOnDaveMLSWelcome_AfterOwnCommit(t *testing.T) {
-	ctx := context.Background()
-	cb := &invalidCountingCallbacks{}
-	s := New("123456789", cb)
-	closeAtCleanup(t, s)
-	externalSenderPackage, extPriv := buildExternalSenderPackageWithKey(t)
-	s.SetChannelID(987654321)
-	s.OnSelectProtocolAck(1)
-	botKP := cb.lastKeyPackage()
-	s.OnDaveMLSExternalSenderPackage(externalSenderPackage)
-	s.OnDavePrepareTransition(0, 1)
+	gw := newFakeGateway(t)
+	gw.connect(recorder)
+	gw.settle()
+	gw.prepareTransitionZero(recorder)
+	gw.settle()
+	gw.requireReady(recorder) // a sole member, encrypting alone
 
-	for _, joiner := range []string{"222222222", "333333333"} {
-		s.AddUser(godave.UserID(joiner))
-		s.OnDaveMLSProposals(buildProposalBatch(addProposalBytesForUser(t, s, extPriv, joiner)))
-	}
-	s.mu.RLock()
-	committed, queued := len(s.pendingCommitBytes) > 0, len(s.proposalQueue)
-	s.mu.RUnlock()
-	if !committed || queued != 1 {
-		t.Fatalf("committed = %v with %d queued batches, want a commit and 1 queued batch", committed, queued)
-	}
+	gw.holdCommits()
+	gw.connect(speaker)
+	gw.settle() // recorder commits over add(speaker), speaker over add(recorder)
+	gw.connect(joiner1)
+	gw.settle() // add(joiner1) reaches both while their commits wait
+	// joiner1's own commit, over add(recorder) and add(speaker), stays on the
+	// wire until the epoch has a winner.
+	gw.receiveCommits(speaker, recorder)
+	gw.releaseCommits()
+	gw.settle()
 
-	peer, groupID, welcome := newPeerGroupForExternalSender(t, botKP, externalSenderPackage)
-	s.OnDaveMLSWelcome(1, welcome)
-
-	stats := s.Stats()
-	if stats.WelcomesJoined != 1 || stats.WelcomesFailed != 0 {
-		t.Fatalf("WelcomesJoined = %d, WelcomesFailed = %d, want 1 and 0", stats.WelcomesJoined, stats.WelcomesFailed)
-	}
-	if invalid := cb.invalid.Load(); invalid != 0 {
-		t.Fatalf("invalid_commit_welcome sent %d times, want 0", invalid)
-	}
-	wantEpoch, err := peer.Epoch(ctx, groupID)
-	if err != nil {
-		t.Fatalf("peer.Epoch: %v", err)
-	}
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	if s.pendingEpoch == nil || s.pendingEpoch.id != wantEpoch {
-		t.Fatalf("pending epoch = %+v, want epoch %d", s.pendingEpoch, wantEpoch)
-	}
-	if len(s.pendingCommitBytes) != 0 || len(s.proposalQueue) != 0 {
-		t.Fatalf("%d bytes of our commit and %d queued batches left after the Welcome", len(s.pendingCommitBytes), len(s.proposalQueue))
-	}
+	gw.requireWinner(0, speaker)
+	gw.requireNoRestart()
+	gw.requireConverged()
 }

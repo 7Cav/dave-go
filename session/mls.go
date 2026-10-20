@@ -350,24 +350,24 @@ func readTLSVectorLength(data []byte) (uint32, int, error) {
 	}
 }
 
-func (s *Session) processProposalBatchLocked(proposals []byte) (bool, error) {
+func (s *Session) processProposalBatchLocked(proposals []byte) error {
 	if len(proposals) == 0 {
 		s.logger.Debug("processProposalBatchLocked: empty proposals")
 
-		return false, nil
+		return nil
 	}
 	if len(s.groupID) == 0 {
 		// DAVE spec §5: if no local group exists, proposals are ignored.
 		s.logger.Debug("processProposalBatchLocked: no group, ignoring proposals")
 
-		return false, nil
+		return nil
 	}
 
 	// DAVE_MLSProposals payload format (after opcode consumed by gateway):
 	// uint8 operation_type || TLSVector<MLSMessage>
 	// operation_type: 0=append, 1=revoke
 	if len(proposals) < 1 {
-		return false, fmt.Errorf("%w: %d bytes", ErrProposalsTooShort, len(proposals))
+		return fmt.Errorf("%w: %d bytes", ErrProposalsTooShort, len(proposals))
 	}
 
 	operationType := proposals[0]
@@ -375,12 +375,12 @@ func (s *Session) processProposalBatchLocked(proposals []byte) (bool, error) {
 	switch operationType {
 	case 0: // append: TLSVector<MLSMessage> — existing flow below.
 	case 1: // revoke: TLSVector<ProposalRef>
-		return false, s.processRevokeProposalsLocked(proposals[1:])
+		return s.processRevokeProposalsLocked(proposals[1:])
 	default:
 		s.logger.Debug("processProposalBatchLocked: unknown operation_type, ignoring",
 			"operation_type", operationType)
 
-		return false, nil
+		return nil
 	}
 
 	// Parse TLS vector length to get to the raw MLSMessages.
@@ -388,11 +388,11 @@ func (s *Session) processProposalBatchLocked(proposals []byte) (bool, error) {
 	payload := proposals[1:]
 	vecLen, headerSize, err := readTLSVectorLength(payload)
 	if err != nil {
-		return false, fmt.Errorf("reading proposals vector length: %w", err)
+		return fmt.Errorf("reading proposals vector length: %w", err)
 	}
 	end := headerSize + int(vecLen)
 	if end > len(payload) {
-		return false, fmt.Errorf("%w: need %d bytes, have %d", ErrProposalsTruncated, end, len(payload))
+		return fmt.Errorf("%w: need %d bytes, have %d", ErrProposalsTruncated, end, len(payload))
 	}
 
 	s.logger.Debug("proposals vector parsed",
@@ -402,10 +402,9 @@ func (s *Session) processProposalBatchLocked(proposals []byte) (bool, error) {
 		"vector_first_32", fmt.Sprintf("%x", payload[headerSize:minInt(headerSize+32, end)]))
 
 	remaining := payload[headerSize:end]
-	acceptedAny := false
 	for i := 0; len(remaining) > 0; i++ {
 		if len(remaining) < 4 {
-			return acceptedAny, fmt.Errorf("%w: %d bytes", ErrProposalTooShort, len(remaining))
+			return fmt.Errorf("%w: %d bytes", ErrProposalTooShort, len(remaining))
 		}
 		wireOriginal := remaining
 		s.logger.Debug("parsing proposal",
@@ -415,12 +414,12 @@ func (s *Session) processProposalBatchLocked(proposals []byte) (bool, error) {
 
 		msg, err := framing.UnmarshalMLSMessage(remaining)
 		if err != nil {
-			return acceptedAny, fmt.Errorf("parse proposal message: %w", err)
+			return fmt.Errorf("parse proposal message: %w", err)
 		}
 
 		wire := msg.Marshal()
 		if len(wire) == 0 {
-			return acceptedAny, ErrEmptyProposal
+			return ErrEmptyProposal
 		}
 
 		allowed, err := s.proposalAllowedByDAVELocked(msg)
@@ -474,15 +473,14 @@ func (s *Session) processProposalBatchLocked(proposals []byte) (bool, error) {
 
 		// Use original bytes (not re-marshaled) so ProposalRef hash matches gateway's computation.
 		if err := s.mlsClient.client.ProcessPublicMessage(context.Background(), s.groupID, wireOriginal[:len(wire)]); err != nil {
-			return acceptedAny, fmt.Errorf("process proposal public message: %w", err)
+			return fmt.Errorf("process proposal public message: %w", err)
 		}
-		acceptedAny = true
 		remaining = remaining[len(wire):]
 	}
 
 	s.logger.Debug("processProposalBatchLocked: all proposals processed successfully")
 
-	return acceptedAny, nil
+	return nil
 }
 
 func (s *Session) proposalAllowedByDAVELocked(msg *framing.MLSMessage) (bool, error) {
@@ -779,8 +777,7 @@ func (s *Session) activatePendingEpochLocked() {
 	s.pruneRetainedEpochsLocked()
 
 	// Drain queued proposal batches now that the pending epoch has been
-	// activated. Process them one at a time so that each commit can be
-	// queued again if another pending epoch accumulates mid-drain.
+	// activated.
 	s.drainProposalQueueLocked()
 }
 
@@ -803,13 +800,33 @@ func newEpochAddsSender(oldEpoch, newEpoch *epochState) bool {
 	return false
 }
 
+// drainProposalQueueLocked hands each queued batch to handleProposalBatchLocked
+// as if it had just arrived. The gateway broadcast all of them in the epoch
+// that just activated, so a commit over the first batch alone can't win. Each
+// later batch rolls that commit back and commits again over every batch so far.
 func (s *Session) drainProposalQueueLocked() {
-	for len(s.proposalQueue) > 0 && s.pendingEpoch == nil {
-		next := s.proposalQueue[0]
-		s.proposalQueue = s.proposalQueue[1:]
-		s.logger.Debug("draining queued proposal batch", "size", len(next), "remaining_queue", len(s.proposalQueue))
-		s.processAndCommitProposalBatchLocked(next)
+	queue := s.proposalQueue
+	s.proposalQueue = nil
+	for i, next := range queue {
+		s.logger.Debug("draining queued proposal batch", "size", len(next), "remaining_queue", len(queue)-i-1)
+		s.handleProposalBatchLocked(next)
 	}
+}
+
+// cachedProposalCountLocked returns how many proposals the MLS group holds for
+// its next commit. mls.Client has no accessor for them, so it reads the stored
+// group state the way exporterAdapter does.
+func (s *Session) cachedProposalCountLocked() (int, error) {
+	state, err := s.mlsClient.store.LoadGroupState(context.Background(), group.NewGroupID(s.groupID))
+	if err != nil {
+		return 0, fmt.Errorf("load group state: %w", err)
+	}
+	g, err := group.UnmarshalGroupState(state)
+	if err != nil {
+		return 0, fmt.Errorf("unmarshal group state: %w", err)
+	}
+
+	return len(g.StoredProposals()), nil
 }
 
 func (s *Session) pruneRetainedEpochsLocked() {
@@ -867,7 +884,9 @@ func (s *Session) createGroupWithExternalSenderLocked() error {
 // restorePreCommitStateLocked rolls the MLS group back to the snapshot taken
 // just before the last commit. Called when Discord DS echoes a different commit
 // (i.e. another member's commit won) so that processCommitLocked can apply the
-// winning commit from the correct base epoch. Must be called with s.mu held.
+// winning commit from the correct base epoch, and when a proposal batch arrives
+// while the commit waits, so the next commit covers both. Must be called with
+// s.mu held.
 func (s *Session) restorePreCommitStateLocked() error {
 	if len(s.preCommitGroupState) == 0 {
 		return ErrNoPreCommitState
