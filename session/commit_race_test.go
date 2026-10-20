@@ -217,6 +217,52 @@ func TestCommitRace_JoinRushDuringTransition(t *testing.T) {
 	}
 }
 
+// TestCommitRace_MemberLeavesAsAnotherJoins has a member leave an established
+// call as another joins, so the gateway proposes removing the one and adding
+// the other in the same epoch, in one op 27 when it batches. Whichever commit
+// over both wins, every member left has to end at the next epoch with the same
+// keys, and none may start over because it lacks the remove's ref.
+func TestCommitRace_MemberLeavesAsAnotherJoins(t *testing.T) {
+	tests := []struct {
+		name   string
+		order  []godave.UserID // order the gateway takes the held commits
+		winner godave.UserID
+	}{
+		{name: "our commit wins", order: []godave.UserID{recorder, speaker}, winner: recorder},
+		{name: "a peer's commit wins", order: []godave.UserID{speaker, recorder}, winner: speaker},
+	}
+	for _, f := range proposalFramings() {
+		t.Run(f.name, func(t *testing.T) {
+			for _, tt := range tests {
+				t.Run(tt.name, func(t *testing.T) {
+					gw := f.gateway(t)
+					// Each add so far reaches recorder in an op 27 of its own,
+					// so the only batch it can get is the remove and the add.
+					gw.establish(recorder, speaker)
+					gw.connect(joiner1)
+					gw.settle() // joiner1 joins at epoch 2
+					gw.connect(joiner2)
+					gw.deliver()        // joiner2 sends a key package
+					gw.leave(joiner1)   // op 13, then remove(joiner1) to recorder and speaker
+					gw.receive(joiner2) // add(joiner2) goes out right behind the remove
+					gw.holdCommits()
+					gw.settle() // recorder and speaker commit over both; the commits stay on the wire
+					gw.receiveCommits(tt.order...)
+					gw.releaseCommits()
+					gw.settle()
+
+					gw.requireWinner(2, tt.winner)
+					gw.requireNoRestart()
+					gw.requireConverged()
+					if f.batched {
+						gw.requireBatchOf(recorder, 2)
+					}
+				})
+			}
+		})
+	}
+}
+
 // TestCommitRace_RevokeWhileOwnCommitWaits revokes a proposal the waiting
 // commits cover. Members must commit again over the proposals left, and
 // commit nothing when none are left. A commit nobody can accept would restart

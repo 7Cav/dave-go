@@ -317,6 +317,28 @@ func (g *fakeGateway) disconnect(id godave.UserID) {
 	g.media.stop(id)
 }
 
+// leave takes a group member off the call the way a closed voice connection
+// does, between transitions. The gateway tells the others it left with op 13
+// and proposes removing its leaf (protocol.md "Member Remove").
+func (g *fakeGateway) leave(id godave.UserID) {
+	g.t.Helper()
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	c := g.clientLocked(id)
+	if _, member := g.roster[id]; !member || g.transition != nil {
+		g.failf("leave only models a group member leaving between transitions")
+
+		return
+	}
+	g.clients = slices.DeleteFunc(g.clients, func(o *fakeClient) bool { return o == c })
+	g.eventf("%s leaves", id)
+	for _, o := range g.clients {
+		o.inbox = append(o.inbox, clientDisconnect(id))
+	}
+	g.media.stop(id)
+	g.reproposeLocked()
+}
+
 // proposeRefused broadcasts, at the current epoch, a PreSharedKey proposal.
 // DAVE doesn't allow the type, so every member refuses it, and no commit can
 // win until the gateway revokes it.
@@ -769,21 +791,24 @@ func (g *fakeGateway) invalidLocked(c *fakeClient, id uint16) {
 }
 
 // reproposeLocked proposes, at the current epoch, a remove for each stale
-// member's leaf, then an add for each client holding a key package, in
-// connection order, to the members whose leaves aren't stale. Each goes in an
-// op 27 of its own unless the gateway batches proposals. Proposals already in
-// flight aren't sent again.
+// member's leaf, in connection order, and for each member that left the call,
+// then an add for each client holding a key package, in connection order, to
+// the members whose leaves aren't stale. Each goes in an op 27 of its own
+// unless the gateway batches proposals. Proposals already in flight aren't
+// sent again.
 func (g *fakeGateway) reproposeLocked() {
 	if !g.established {
 		return
 	}
 	to := g.membersLocked()
 	for _, c := range g.clients {
-		leaf, member := g.roster[c.id]
-		pending := slices.ContainsFunc(g.proposals, func(p gatewayProposal) bool { return p.remove && p.removes == leaf })
-		if member && c.stale && !pending {
-			g.proposeLocked(group.NewRemoveProposal(group.LeafNodeIndex(leaf)),
-				gatewayProposal{what: fmt.Sprintf("remove(%s@%d)", c.id, leaf), remove: true, removes: leaf}, to)
+		if leaf, member := g.roster[c.id]; member && c.stale {
+			g.proposeRemoveLocked(c.id, leaf, to)
+		}
+	}
+	for _, id := range slices.Sorted(maps.Keys(g.roster)) {
+		if g.clientLocked(id) == nil {
+			g.proposeRemoveLocked(id, g.roster[id], to)
 		}
 	}
 	for _, c := range g.clients {
@@ -791,6 +816,16 @@ func (g *fakeGateway) reproposeLocked() {
 			g.proposeAddLocked(c, to)
 		}
 	}
+}
+
+// proposeRemoveLocked proposes removing id's leaf unless a remove of it is
+// already in flight.
+func (g *fakeGateway) proposeRemoveLocked(id godave.UserID, leaf uint32, to []*fakeClient) {
+	if slices.ContainsFunc(g.proposals, func(p gatewayProposal) bool { return p.remove && p.removes == leaf }) {
+		return
+	}
+	g.proposeLocked(group.NewRemoveProposal(group.LeafNodeIndex(leaf)),
+		gatewayProposal{what: fmt.Sprintf("remove(%s@%d)", id, leaf), remove: true, removes: leaf}, to)
 }
 
 func (g *fakeGateway) proposeAddLocked(c *fakeClient, to []*fakeClient) {
