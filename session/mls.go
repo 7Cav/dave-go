@@ -544,10 +544,21 @@ func (s *Session) processProposalBatchLocked(proposals []byte) error {
 			}
 		}
 
-		// wire holds the gateway's bytes, not a re-marshal, so the ProposalRef
-		// the group files the proposal under matches the one a commit cites.
+		// mls-go files the proposal under a ref it hashes from its own
+		// re-marshal of the message. That equals wire, since mls-go parses only
+		// the shortest encoding of each length, so the ref matches the one the
+		// gateway and a peer's commit cite.
 		if err := s.mlsClient.client.ProcessPublicMessage(context.Background(), s.groupID, wire); err != nil {
-			return fmt.Errorf("process proposal public message: %w", err)
+			// mls-go refused the proposal: its signature or key package
+			// doesn't verify, or it names another epoch. The session's group
+			// stays as it was, and the batch goes on, because "All clients
+			// must process any valid proposals they receive" (protocol.md).
+			s.stats.ProposalsRejected++
+			s.logger.Warn("processProposalBatchLocked: rejecting proposal the MLS client refused",
+				"error", err,
+				"index", i)
+
+			continue
 		}
 	}
 

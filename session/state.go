@@ -93,14 +93,15 @@ type Stats struct {
 	// survived long enough to reach the decryptor after a prior successful
 	// decryption.
 	RejectedReplayFrames uint64
-	// ProposalsRejected counts MLS proposals refused by the DAVE validation
-	// layer before reaching the MLS client: disallowed sender or proposal
-	// type (only Add/Remove from the voice gateway's external sender are
-	// allowed, protocol.md "Proposal Handling"), add proposals for users not
-	// expected in the session, and proposals that failed safe inspection
-	// (fail-closed). Zero in normal operation; growth means the gateway is
-	// sending malformed batches or something is probing the session with
-	// crafted proposals — i.e. the validation layer actively doing its job.
+	// ProposalsRejected counts MLS proposals the session refused: disallowed
+	// sender or proposal type (only Add/Remove from the voice gateway's
+	// external sender are allowed, protocol.md "Proposal Handling"), add
+	// proposals for users not expected in the session, proposals that failed
+	// safe inspection (fail-closed), and proposals the MLS client refused,
+	// such as one whose signature or key package doesn't verify. The session
+	// takes in the rest of the batch. Zero in normal operation. Growth means
+	// the gateway is sending malformed batches or something is probing the
+	// session with crafted proposals, and the session is refusing them.
 	ProposalsRejected uint64
 	// DowngradeToV0 counts the number of times the session was downgraded
 	// from DAVE E2EE (protocol version ≥ 1) to transport-only encryption

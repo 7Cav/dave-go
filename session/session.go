@@ -882,9 +882,9 @@ func (s *Session) processAndCommitProposalBatchLocked(proposals []byte) {
 		return
 	}
 	if err := s.processProposalBatchLocked(proposals); err != nil {
-		// A batch the session can't frame leaves nothing cached. Proposals
-		// taken in before a later failure stay cached, and the commit below
-		// covers them.
+		// A batch that fails leaves nothing of it cached. The commit below
+		// still covers proposals an earlier batch left cached, such as those
+		// a rollback brought back.
 		s.logger.Error("failed to process proposals", "error", err, "size", len(proposals))
 	}
 	if len(s.groupID) == 0 {

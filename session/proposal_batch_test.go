@@ -85,6 +85,13 @@ func (c batchCall) propose(tb testing.TB, p *group.Proposal) (msg, ref []byte) {
 // add proposes adding id with a fresh key package.
 func (c batchCall) add(tb testing.TB, id godave.UserID) (msg, ref []byte) {
 	tb.Helper()
+
+	return c.propose(tb, group.NewAddProposal(freshKeyPackage(tb, id)))
+}
+
+// freshKeyPackage is a new key package for id, signed by id.
+func freshKeyPackage(tb testing.TB, id godave.UserID) *keypackages.KeyPackage {
+	tb.Helper()
 	identity, err := userIDToIdentityBytes(id)
 	if err != nil {
 		tb.Fatal(err)
@@ -94,7 +101,7 @@ func (c batchCall) add(tb testing.TB, id godave.UserID) (msg, ref []byte) {
 		tb.Fatal(err)
 	}
 
-	return c.propose(tb, group.NewAddProposal(kp))
+	return kp
 }
 
 // processBatch hands batch to processProposalBatchLocked and returns its error.
@@ -196,6 +203,17 @@ func TestOnDaveMLSProposals_TakesInEveryProposalInABatch(t *testing.T) {
 				msg, ref := c.add(t, joiner1)
 
 				return withSender(t, msg, framing.Sender{Type: framing.SenderTypeNewMemberProposal}, nil), ref, false
+			},
+		},
+		{
+			name: "an add whose key package signature doesn't verify",
+			between: func(t *testing.T, c batchCall) ([]byte, []byte, bool) {
+				t.Helper()
+				kp := freshKeyPackage(t, joiner1)
+				kp.Signature[len(kp.Signature)-1] ^= 0x01
+				msg, ref := c.propose(t, group.NewAddProposal(kp))
+
+				return msg, ref, false
 			},
 		},
 		{
