@@ -146,6 +146,8 @@ type fakeClient struct {
 	commits map[uint64]int
 	// largestBatch is the most proposals any op 27 delivered to it carried.
 	largestBatch int
+	// sentCommits counts the op 28s its session sent, taken or not.
+	sentCommits int
 }
 
 type gatewayTransition struct {
@@ -932,6 +934,9 @@ func (g *fakeGateway) send(id godave.UserID, m clientMessage) {
 	defer g.mu.Unlock()
 	if c := g.clientLocked(id); c != nil {
 		c.outbox = append(c.outbox, m)
+		if m.op == opCommitWelcome {
+			c.sentCommits++
+		}
 	}
 }
 
@@ -1322,6 +1327,46 @@ func (g *fakeGateway) requireRestartsOnly(users ...godave.UserID) {
 func (g *fakeGateway) requireNoRestart() {
 	g.t.Helper()
 	g.requireRestartsOnly()
+}
+
+// commitsSent returns how many op 28s each client's session has sent so far,
+// for requireNoCommitSince.
+func (g *fakeGateway) commitsSent() map[godave.UserID]int {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	sent := map[godave.UserID]int{}
+	for _, c := range g.clients {
+		sent[c.id] = c.sentCommits
+	}
+
+	return sent
+}
+
+// requireNoCommitSince requires that no session has sent an op 28 since
+// commitsSent returned before, whether or not the gateway took it.
+func (g *fakeGateway) requireNoCommitSince(before map[godave.UserID]int) {
+	g.t.Helper()
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	for _, c := range g.clients {
+		if n := c.sentCommits - before[c.id]; n > 0 {
+			g.t.Errorf("%s sent %d more commits, want none", c.id, n)
+		}
+	}
+}
+
+// requireNothingCached requires that no session holds a proposal that no
+// announced commit covers.
+func (g *fakeGateway) requireNothingCached() {
+	g.t.Helper()
+	g.mu.Lock()
+	clients := slices.Clone(g.clients)
+	g.mu.Unlock()
+	for _, c := range clients {
+		if refs := cachedProposalRefs(g.t, c.s); len(refs) > 0 {
+			g.t.Errorf("%s holds %d proposals, want none", c.id, len(refs))
+		}
+	}
 }
 
 // requireBatchOf requires that some op 27 the gateway delivered to id carried

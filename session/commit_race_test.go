@@ -266,9 +266,9 @@ func TestCommitRace_MemberLeavesAsAnotherJoins(t *testing.T) {
 }
 
 // TestCommitRace_RevokeWhileOwnCommitWaits revokes a proposal the waiting
-// commits cover. Members must commit again over the proposals left, and
-// commit nothing when none are left. A commit nobody can accept would restart
-// DAVE when its watchdog fires. No member ever has two proposals queued at
+// commits cover. Members must commit again over the proposals left. When none
+// are left, they must hold nothing and commit nothing. A commit nobody can
+// accept would restart DAVE when its watchdog fires. No member ever has two proposals queued at
 // once, so batching changes nothing here.
 func TestCommitRace_RevokeWhileOwnCommitWaits(t *testing.T) {
 	for _, f := range proposalFramings() {
@@ -296,14 +296,17 @@ func TestCommitRace_RevokeWhileOwnCommitWaits(t *testing.T) {
 				gw.establish(recorder, speaker)
 				gw.holdCommits()
 				gw.connect(joiner1)
-				gw.settle()
+				gw.settle() // recorder and speaker commit over add(joiner1)
+				sent := gw.commitsSent()
 				gw.disconnect(joiner1)
-				gw.settle()
+				gw.settle() // the gateway revokes add(joiner1), the only proposal in flight
+				gw.requireNothingCached()
 				gw.releaseCommits()
 				gw.settle() // the commits over the revoked add arrive and lose
 				time.Sleep(2 * recoveryTimeout)
 				gw.settle()
 				gw.requireNoRestart()
+				gw.requireNoCommitSince(sent)
 				gw.resetRecoveryTimeout()
 				gw.connect(joiner2)
 				gw.settle()
