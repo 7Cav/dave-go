@@ -13,7 +13,6 @@ var (
 	ErrProposalsTooShort         = errors.New("session: proposals payload too short")
 	ErrProposalsTruncated        = errors.New("session: proposals vector truncated")
 	ErrProposalTooShort          = errors.New("session: proposal too short")
-	ErrEmptyProposal             = errors.New("session: empty marshaled proposal")
 	ErrInvalidExternalSender     = errors.New("session: invalid external sender for joined welcome")
 	ErrNoExternalSender          = errors.New("session: no external sender package available")
 	ErrNoChannelID               = errors.New("session: no channel ID set")
@@ -26,9 +25,14 @@ var (
 
 	// Deprecated: no longer returned.
 	ErrNoCodecForSSRC = errors.New("session: no codec assigned for ssrc")
+	// Deprecated: no longer returned.
+	ErrEmptyProposal = errors.New("session: empty marshaled proposal")
 )
 
 var (
 	errSendFailed = errors.New("session: gateway send failed")
 	errSuperseded = errors.New("session: send no longer wanted")
+	// errMalformedMessage is an MLSMessage in an op 27 that the session can't
+	// find the end of.
+	errMalformedMessage = errors.New("session: malformed MLS message")
 )

@@ -312,7 +312,11 @@ func (s *Session) batchOnPreCommitEpochLocked(proposals []byte) bool {
 	if err != nil || headerSize+int(vecLen) > len(proposals)-1 {
 		return true
 	}
-	msg, err := framing.UnmarshalMLSMessage(proposals[1+headerSize : 1+headerSize+int(vecLen)])
+	msgs, err := splitMLSMessages(proposals[1+headerSize : 1+headerSize+int(vecLen)])
+	if err != nil || len(msgs) == 0 {
+		return true
+	}
+	msg, err := framing.UnmarshalMLSMessage(msgs[0])
 	if err != nil {
 		return true
 	}
@@ -467,31 +471,32 @@ func (s *Session) processProposalBatchLocked(proposals []byte) error {
 		return fmt.Errorf("%w: need %d bytes, have %d", ErrProposalsTruncated, end, len(payload))
 	}
 
+	// Frame the whole vector before taking any proposal in, so a vector the
+	// session can't frame leaves the group as it was.
+	msgs, err := splitMLSMessages(payload[headerSize:end])
+	if err != nil {
+		return fmt.Errorf("frame proposals: %w", err)
+	}
 	s.logger.Debug("proposals vector parsed",
 		"vec_len", vecLen,
 		"header_size", headerSize,
-		"payload_first_32", fmt.Sprintf("%x", payload[:minInt(32, len(payload))]),
-		"vector_first_32", fmt.Sprintf("%x", payload[headerSize:minInt(headerSize+32, end)]))
+		"messages", len(msgs))
 
-	remaining := payload[headerSize:end]
-	for i := 0; len(remaining) > 0; i++ {
-		if len(remaining) < 4 {
-			return fmt.Errorf("%w: %d bytes", ErrProposalTooShort, len(remaining))
-		}
-		wireOriginal := remaining
+	for i, wire := range msgs {
 		s.logger.Debug("parsing proposal",
 			"index", i,
-			"remaining_bytes", len(remaining),
-			"wire_hex", fmt.Sprintf("%x", remaining[:minInt(64, len(remaining))]))
+			"size", len(wire),
+			"wire_hex", fmt.Sprintf("%x", wire[:minInt(64, len(wire))]))
 
-		msg, err := framing.UnmarshalMLSMessage(remaining)
+		msg, err := framing.UnmarshalMLSMessage(wire)
 		if err != nil {
-			return fmt.Errorf("parse proposal message: %w", err)
-		}
+			// fail closed: a proposal mls-go can't parse can't be inspected.
+			s.stats.ProposalsRejected++
+			s.logger.Warn("processProposalBatchLocked: rejecting proposal that failed inspection",
+				"error", err,
+				"index", i)
 
-		wire := msg.Marshal()
-		if len(wire) == 0 {
-			return ErrEmptyProposal
+			continue
 		}
 
 		allowed, err := s.proposalAllowedByDAVELocked(msg)
@@ -501,7 +506,6 @@ func (s *Session) processProposalBatchLocked(proposals []byte) error {
 			s.logger.Warn("processProposalBatchLocked: rejecting proposal that failed inspection",
 				"error", err,
 				"index", i)
-			remaining = remaining[len(wire):]
 
 			continue
 		}
@@ -509,7 +513,6 @@ func (s *Session) processProposalBatchLocked(proposals []byte) error {
 			s.stats.ProposalsRejected++
 			s.logger.Warn("processProposalBatchLocked: rejecting disallowed proposal sender/type",
 				"index", i)
-			remaining = remaining[len(wire):]
 
 			continue
 		}
@@ -527,7 +530,6 @@ func (s *Session) processProposalBatchLocked(proposals []byte) error {
 			s.logger.Warn("processProposalBatchLocked: rejecting proposal that failed inspection",
 				"error", err,
 				"index", i)
-			remaining = remaining[len(wire):]
 
 			continue
 		}
@@ -537,17 +539,16 @@ func (s *Session) processProposalBatchLocked(proposals []byte) error {
 				s.logger.Warn("processProposalBatchLocked: ignoring add proposal for unexpected user",
 					"user_id", userID,
 					"index", i)
-				remaining = remaining[len(wire):]
 
 				continue
 			}
 		}
 
-		// Use original bytes (not re-marshaled) so ProposalRef hash matches gateway's computation.
-		if err := s.mlsClient.client.ProcessPublicMessage(context.Background(), s.groupID, wireOriginal[:len(wire)]); err != nil {
+		// wire holds the gateway's bytes, not a re-marshal, so the ProposalRef
+		// the group files the proposal under matches the one a commit cites.
+		if err := s.mlsClient.client.ProcessPublicMessage(context.Background(), s.groupID, wire); err != nil {
 			return fmt.Errorf("process proposal public message: %w", err)
 		}
-		remaining = remaining[len(wire):]
 	}
 
 	s.logger.Debug("processProposalBatchLocked: all proposals processed successfully")
