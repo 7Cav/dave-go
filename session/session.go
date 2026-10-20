@@ -873,7 +873,8 @@ func (s *Session) handleProposalBatchLocked(proposals []byte) {
 }
 
 // processAndCommitProposalBatchLocked processes a proposal batch and commits
-// every proposal the group then holds. Must be called with s.mu held.
+// every proposal the group then holds. Must be called with sendMu and s.mu
+// held.
 func (s *Session) processAndCommitProposalBatchLocked(proposals []byte) {
 	if err := s.ensureMLSClientLocked(); err != nil {
 		s.logger.Error("failed to init mls client", "error", err)

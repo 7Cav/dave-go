@@ -876,6 +876,7 @@ func newEpochAddsSender(oldEpoch, newEpoch *epochState) bool {
 // as if it had just arrived. The gateway broadcast all of them in the epoch
 // that just activated, so a commit over the first batch alone can't win. Each
 // later batch rolls that commit back and commits again over every batch so far.
+// Must be called with sendMu and s.mu held.
 func (s *Session) drainProposalQueueLocked() {
 	queue := s.proposalQueue
 	s.proposalQueue = nil

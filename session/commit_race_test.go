@@ -153,6 +153,7 @@ func TestCommitRace_RevokeWhileOwnCommitWaits(t *testing.T) {
 		time.Sleep(2 * recoveryTimeout)
 		gw.settle()
 		gw.requireNoRestart()
+		gw.resetRecoveryTimeout()
 		gw.connect(joiner2)
 		gw.settle()
 

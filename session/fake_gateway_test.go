@@ -358,6 +358,21 @@ func (g *fakeGateway) proposalsOvertake(id godave.UserID) {
 	g.eventf("%s gets its op 27s first", id)
 }
 
+// resetRecoveryTimeout puts every session, and every one connected later,
+// back on gatewayRecoveryTimeout, once a test that shortened it has seen what
+// it waited for. Watchdogs armed from then on can't fire during a slow run.
+func (g *fakeGateway) resetRecoveryTimeout() {
+	g.mu.Lock()
+	g.opts.recoveryTimeout = gatewayRecoveryTimeout
+	clients := slices.Clone(g.clients)
+	g.mu.Unlock()
+	for _, c := range clients {
+		c.s.lockMLS()
+		c.s.recoveryTimeout = gatewayRecoveryTimeout
+		c.s.unlockMLS()
+	}
+}
+
 // holdCommits keeps op 28s on the wire until receiveCommits or releaseCommits.
 func (g *fakeGateway) holdCommits() {
 	g.mu.Lock()
