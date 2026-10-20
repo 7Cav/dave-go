@@ -158,6 +158,56 @@ func withOverlongAuthenticatedData(t *testing.T, msg []byte, groupIDLen int) []b
 	return append(out, msg[at+1:]...)
 }
 
+// otherGroupHandshake has a session in another group add a member and then
+// remove it. It returns the bare Welcome of the add's op 28 and the commit
+// over the remove, as an MLSMessage. A commit over a remove carries an
+// UpdatePath.
+func otherGroupHandshake(t *testing.T) (welcome, commit []byte) {
+	t.Helper()
+	other := newBatchCall(t, joiner3)
+	add, _ := other.add(t, joiner3)
+	other.s.OnDaveMLSProposals(buildProposalBatch(add))
+	added := other.lastCommit(t)
+	if len(added.welcome) == 0 {
+		t.Fatal("the other session's op 28 over an add carries no Welcome")
+	}
+	other.s.OnDaveMLSPrepareCommitTransition(1, added.commit)
+	other.s.OnDaveExecuteTransition(1)
+	remove, _ := other.propose(t, group.NewRemoveProposal(1))
+	other.s.OnDaveMLSProposals(buildProposalBatch(remove))
+	removed := other.lastCommit(t)
+	if removed.epoch != added.epoch+1 {
+		t.Fatalf("the other session committed the remove at epoch %d, want %d", removed.epoch, added.epoch+1)
+	}
+
+	return added.welcome, removed.commit
+}
+
+// lastCommit parses the last op 28 the session sent.
+func (c batchCall) lastCommit(t *testing.T) commitInfo {
+	t.Helper()
+	sent := c.sent.sent()
+	if len(sent) == 0 {
+		t.Fatal("the session sent no commit")
+	}
+	info, err := parseCommit(recorder, sent[len(sent)-1])
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	return info
+}
+
+// opNightUsers are 40 members joining at once, as at the start of an op night.
+func opNightUsers() []godave.UserID {
+	users := make([]godave.UserID, 40)
+	for i := range users {
+		users[i] = godave.UserID(strconv.Itoa(700000000 + i))
+	}
+
+	return users
+}
+
 // TestOnDaveMLSProposals_TakesInEveryProposalInABatch hands a session one op 27
 // with several proposals. The session takes in every one DAVE allows, refuses
 // the others, and its commit cites exactly the ones it took in.
@@ -225,6 +275,111 @@ func TestOnDaveMLSProposals_TakesInEveryProposalInABatch(t *testing.T) {
 				return withOverlongAuthenticatedData(t, msg, len(c.s.groupID)), ref, false
 			},
 		},
+		{
+			name: "an update proposal",
+			between: func(t *testing.T, c batchCall) ([]byte, []byte, bool) {
+				t.Helper()
+				leaf := freshKeyPackage(t, joiner1).LeafNode
+				leaf.LeafNodeSource, leaf.Lifetime = 2, nil // update (RFC 9420 §7.2)
+				msg, ref := c.propose(t, group.NewUpdateProposal(leaf))
+
+				return msg, ref, false
+			},
+		},
+		{
+			name: "a resumption PSK proposal",
+			between: func(t *testing.T, c batchCall) ([]byte, []byte, bool) {
+				t.Helper()
+				msg, ref := c.propose(t, group.NewResumptionPSKProposal(c.s.groupID, 1, bytes.Repeat([]byte{0x05}, 32)))
+
+				return msg, ref, false
+			},
+		},
+		{
+			name: "a ReInit proposal",
+			between: func(t *testing.T, c batchCall) ([]byte, []byte, bool) {
+				t.Helper()
+				msg, ref := c.propose(t, group.NewReInitProposal(c.s.groupID, keypackages.MLS10, keypackages.MLS128DHKEMP256,
+					[]group.Extension{{Type: 0xff00, Data: []byte("dave")}}))
+
+				return msg, ref, false
+			},
+		},
+		{
+			name: "an ExternalInit proposal",
+			between: func(t *testing.T, c batchCall) ([]byte, []byte, bool) {
+				t.Helper()
+				msg, ref := c.propose(t, &group.Proposal{
+					Type:         group.ProposalTypeExternalInit,
+					ExternalInit: &group.ExternalInitProposal{KemOutput: bytes.Repeat([]byte{0x04}, 65)},
+				})
+
+				return msg, ref, false
+			},
+		},
+		{
+			name: "a GroupContextExtensions proposal",
+			between: func(t *testing.T, c batchCall) ([]byte, []byte, bool) {
+				t.Helper()
+				msg, ref := c.propose(t, group.NewGroupContextExtensionsProposal([]group.Extension{{Type: 0xff00, Data: []byte("dave")}}))
+
+				return msg, ref, false
+			},
+		},
+		{
+			name: "a commit",
+			between: func(t *testing.T, _ batchCall) ([]byte, []byte, bool) {
+				t.Helper()
+				_, commit := otherGroupHandshake(t)
+
+				return commit, nil, false
+			},
+		},
+		{
+			name: "a Welcome",
+			between: func(t *testing.T, _ batchCall) ([]byte, []byte, bool) {
+				t.Helper()
+				welcome, _ := otherGroupHandshake(t)
+
+				return (&framing.MLSMessage{Welcome: welcome}).Marshal(), nil, false
+			},
+		},
+		{
+			name: "a GroupInfo",
+			between: func(t *testing.T, c batchCall) ([]byte, []byte, bool) {
+				t.Helper()
+				info, err := c.s.mlsClient.client.GroupInfo(t.Context(), c.s.groupID)
+				if err != nil {
+					t.Fatal(err)
+				}
+
+				return (&framing.MLSMessage{GroupInfo: info}).Marshal(), nil, false
+			},
+		},
+		{
+			name: "a KeyPackage",
+			between: func(t *testing.T, _ batchCall) ([]byte, []byte, bool) {
+				t.Helper()
+
+				return (&framing.MLSMessage{KeyPackage: freshKeyPackage(t, joiner1).Marshal()}).Marshal(), nil, false
+			},
+		},
+		{
+			name: "a PrivateMessage",
+			between: func(t *testing.T, c batchCall) ([]byte, []byte, bool) {
+				t.Helper()
+				msg := framing.NewMLSMessagePrivate(&framing.PrivateMessage{
+					GroupID:             c.s.groupID,
+					Epoch:               1,
+					ContentType:         framing.ContentTypeProposal,
+					AuthenticatedData:   []byte{},
+					EncryptedSenderData: bytes.Repeat([]byte{0x02}, 28),
+					Ciphertext:          bytes.Repeat([]byte{0x03}, 48),
+				})
+
+				return msg.Marshal(), nil, false
+			},
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -260,10 +415,38 @@ func TestOnDaveMLSProposals_TakesInEveryProposalInABatch(t *testing.T) {
 	}
 }
 
-// TestProcessProposalBatch_RefusesAVectorItCannotFrame hands a session an op 27
-// whose vector doesn't split into whole messages. Processing fails without a
-// panic, and the session takes in none of the batch, so it commits nothing.
-func TestProcessProposalBatch_RefusesAVectorItCannotFrame(t *testing.T) {
+// TestOnDaveMLSProposals_TakesInFortyAddsInOneBatch hands a session one op 27
+// that adds 40 members. Its commit cites every one.
+func TestOnDaveMLSProposals_TakesInFortyAddsInOneBatch(t *testing.T) {
+	users := opNightUsers()
+	c := newBatchCall(t, users...)
+	msgs := make([][]byte, 0, len(users))
+	refs := make([][]byte, 0, len(users))
+	for _, id := range users {
+		msg, ref := c.add(t, id)
+		msgs = append(msgs, msg)
+		refs = append(refs, ref)
+	}
+
+	c.s.OnDaveMLSProposals(buildProposalBatch(bytes.Join(msgs, nil)))
+
+	sent := c.sent.sent()
+	if len(sent) != 1 {
+		t.Fatalf("the session sent %d commits, want 1", len(sent))
+	}
+	info, err := parseCommit(recorder, sent[0])
+	if err != nil {
+		t.Fatalf("the session's op 28: %v", err)
+	}
+	if !sameRefs(info.refs, refs) {
+		t.Errorf("the commit cites %d proposals, want all %d adds", len(info.refs), len(refs))
+	}
+}
+
+// TestOnDaveMLSProposals_RefusesAVectorItCannotFrame hands a session an op 27
+// whose vector doesn't split into whole messages. The session takes in none
+// of the batch, so it commits nothing.
+func TestOnDaveMLSProposals_RefusesAVectorItCannotFrame(t *testing.T) {
 	c := newBatchCall(t, speaker, joiner1, joiner2)
 	first, _ := c.add(t, speaker)
 	second, _ := c.add(t, joiner1)
@@ -271,11 +454,7 @@ func TestProcessProposalBatch_RefusesAVectorItCannotFrame(t *testing.T) {
 	whole := bytes.Join([][]byte{first, second}, nil)
 	refuses := func(t *testing.T, vec []byte) {
 		t.Helper()
-		batch := buildProposalBatch(vec)
-		if err := c.processBatch(batch); err == nil {
-			t.Fatal("processing the batch succeeded")
-		}
-		c.s.OnDaveMLSProposals(batch)
+		c.s.OnDaveMLSProposals(buildProposalBatch(vec))
 		if n := len(c.sent.sent()); n != 0 {
 			t.Fatalf("the session sent %d commits over a batch it can't frame", n)
 		}
@@ -292,12 +471,9 @@ func TestProcessProposalBatch_RefusesAVectorItCannotFrame(t *testing.T) {
 }
 
 // BenchmarkProcessProposalBatch_FortyAdds times taking in one op 27 that adds
-// 40 members, as at the start of an op night.
+// 40 members.
 func BenchmarkProcessProposalBatch_FortyAdds(b *testing.B) {
-	users := make([]godave.UserID, 40)
-	for i := range users {
-		users[i] = godave.UserID(strconv.Itoa(700000000 + i))
-	}
+	users := opNightUsers()
 	c := newBatchCall(b, users...)
 	msgs := make([][]byte, 0, len(users))
 	for _, id := range users {

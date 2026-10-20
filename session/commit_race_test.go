@@ -41,7 +41,9 @@ func TestCommitRace_BatchWhileOwnCommitWaits(t *testing.T) {
 		order       []godave.UserID // order the gateway takes the held commits
 		winner      godave.UserID
 		// batchTo gets two proposals in one op 27 when the gateway batches.
-		// Empty when the scenario never queues two for one member.
+		// Empty when the scenario never queues two for one member. In the
+		// first-setup rows it is joiner1, which joins by Welcome whatever it
+		// makes of the batch, so those rows don't test recorder taking one in.
 		batchTo godave.UserID
 	}{
 		{name: "first setup, our new commit wins", order: []godave.UserID{recorder, speaker}, winner: recorder, batchTo: joiner1},
