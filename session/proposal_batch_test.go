@@ -3,6 +3,7 @@ package session
 import (
 	"bytes"
 	"context"
+	"log/slog"
 	"slices"
 	"strconv"
 	"sync"
@@ -44,13 +45,20 @@ type batchCall struct {
 	s       *Session
 	gateway gatewaySender
 	sent    *commitCapture
+	logs    *lockedBuffer // what s logged at INFO and above, as JSON lines
 }
 
 func newBatchCall(tb testing.TB, users ...godave.UserID) batchCall {
 	tb.Helper()
 	pkg, priv := buildExternalSenderPackageWithKey(tb)
 	cb := &commitCapture{}
-	s := New(recorder, cb)
+	logs := &lockedBuffer{}
+	tb.Cleanup(func() {
+		if tb.Failed() {
+			tb.Logf("session logs:\n%s", logs.String())
+		}
+	})
+	s := New(recorder, cb, WithLogger(slog.New(slog.NewJSONHandler(logs, nil))))
 	closeAtCleanup(tb, s)
 	s.SetChannelID(callChannel)
 	s.OnSelectProtocolAck(1)
@@ -63,7 +71,7 @@ func newBatchCall(tb testing.TB, users ...godave.UserID) batchCall {
 		s.AddUser(id)
 	}
 
-	return batchCall{s: s, gateway: gatewaySender{pkg: pkg, key: ciphersuite.NewSignaturePrivateKey(priv)}, sent: cb}
+	return batchCall{s: s, gateway: gatewaySender{pkg: pkg, key: ciphersuite.NewSignaturePrivateKey(priv)}, sent: cb, logs: logs}
 }
 
 // propose signs p at the group's epoch the way the gateway does. It returns

@@ -898,20 +898,20 @@ func (s *Session) drainProposalQueueLocked() {
 	}
 }
 
-// cachedProposalCountLocked returns how many proposals the MLS group holds for
-// its next commit. mls.Client has no accessor for them, so it reads the stored
-// group state the way exporterAdapter does.
-func (s *Session) cachedProposalCountLocked() (int, error) {
+// cachedProposalsLocked returns the proposals the MLS group holds for its next
+// commit. mls.Client has no accessor for them, so it reads the stored group
+// state the way exporterAdapter does.
+func (s *Session) cachedProposalsLocked() ([]group.StoredProposal, error) {
 	state, err := s.mlsClient.store.LoadGroupState(context.Background(), group.NewGroupID(s.groupID))
 	if err != nil {
-		return 0, fmt.Errorf("load group state: %w", err)
+		return nil, fmt.Errorf("load group state: %w", err)
 	}
 	g, err := group.UnmarshalGroupState(state)
 	if err != nil {
-		return 0, fmt.Errorf("unmarshal group state: %w", err)
+		return nil, fmt.Errorf("unmarshal group state: %w", err)
 	}
 
-	return len(g.StoredProposals()), nil
+	return g.StoredProposals(), nil
 }
 
 func (s *Session) pruneRetainedEpochsLocked() {
@@ -1258,14 +1258,12 @@ func (s *Session) commitProposalsLocked() error {
 const maxRevokeRefs = 256
 
 // readRevokeRefs reads the refs of a revoke op 27 from the payload after
-// operation_type: ProposalRef proposal_refs<V> (protocol.md:1020-1048). A
-// ProposalRef is an opaque HashReference<V> (RFC 9420 §5.2), so each ref in
-// the vector is a varint length and then that many bytes, as mlspp writes it
-// for libdave. It refuses the whole revoke if the vector runs past the
-// payload, ends inside a ref or holds more than maxRevokeRefs refs. Like
-// libdave, it takes a ref of any length. A ref that isn't 32 bytes can't name
-// a cached proposal, so it withdraws nothing. Neither does a 32-byte ref the
-// group doesn't hold.
+// operation_type. protocol.md:1020-1048 gives that payload as ProposalRef
+// proposal_refs<V>, and RFC 9420 §5.2 makes a ProposalRef an opaque
+// HashReference<V>. So each ref in the vector is a varint length and then that
+// many bytes, as mlspp writes it for libdave. Like libdave, it takes a ref of
+// any length. It refuses the whole revoke if the vector runs past the payload,
+// ends inside a ref or holds more than maxRevokeRefs refs.
 func readRevokeRefs(payload []byte) ([][]byte, error) {
 	vecLen, headerSize, err := readTLSVectorLength(payload)
 	if err != nil {
@@ -1315,6 +1313,25 @@ func (s *Session) processRevokeProposalsLocked(payload []byte) error {
 	s.logger.Debug("processProposalBatchLocked: revoke",
 		"ref_count", len(refs),
 		"first_ref", fmt.Sprintf("%x", refs[0][:minInt(16, len(refs[0]))]))
+	cached, err := s.cachedProposalsLocked()
+	if err != nil {
+		return err
+	}
+	var unheld []string
+	for _, ref := range refs {
+		if !slices.ContainsFunc(cached, func(p group.StoredProposal) bool { return bytes.Equal(p.Ref, ref) }) {
+			unheld = append(unheld, fmt.Sprintf("%x", ref))
+		}
+	}
+	if len(unheld) > 0 {
+		// The gateway counted these proposals and this session didn't, so the
+		// gateway may have dropped any commit this session sent before the
+		// revoke.
+		s.logger.Warn("revoke names proposals this session does not hold",
+			"ref_count", len(refs),
+			"unheld_count", len(unheld),
+			"unheld_refs", unheld)
+	}
 	if err := s.mlsClient.client.RevokeProposals(
 		context.Background(), s.groupID, refs,
 	); err != nil {

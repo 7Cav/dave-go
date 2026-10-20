@@ -4,17 +4,20 @@ import (
 	"bytes"
 	"context"
 	"encoding/hex"
+	"encoding/json"
+	"log/slog"
 	"slices"
+	"strings"
 	"sync"
 	"testing"
 
 	"github.com/thomas-vilte/mls-go/group"
 )
 
-// buildRevokeBatch builds a revoke op 27 payload: operation_type 1, then
-// ProposalRef proposal_refs<V> (protocol.md:1020-1048). A ProposalRef is an
-// opaque HashReference<V>, so each ref carries its own length inside the
-// vector, the way mlspp writes it for libdave.
+// buildRevokeBatch builds a revoke op 27 payload, operation_type 1 and then
+// ProposalRef proposal_refs<V>, as protocol.md:1020-1048 gives it. A
+// ProposalRef is an opaque HashReference<V>, so each ref carries its own length
+// inside the vector, the way mlspp writes it for libdave.
 func buildRevokeBatch(refs ...[]byte) []byte {
 	var body []byte
 	for _, ref := range refs {
@@ -58,8 +61,8 @@ func cachedProposalRefs(tb testing.TB, s *Session) [][]byte {
 
 // TestProcessProposalBatch_RevokeWithdrawsTheRefsItNames hands a session that
 // holds two proposals a revoke op 27. The session withdraws each proposal the
-// revoke names. A revoke it can't read, or one with more refs than
-// maxRevokeRefs, withdraws nothing.
+// revoke names and skips a ref it doesn't hold, which a WARN names. A revoke
+// it can't read, or one with more refs than maxRevokeRefs, withdraws nothing.
 func TestProcessProposalBatch_RevokeWithdrawsTheRefsItNames(t *testing.T) {
 	c := newBatchCall(t, speaker, joiner1)
 	first, firstRef := c.add(t, speaker)
@@ -69,22 +72,54 @@ func TestProcessProposalBatch_RevokeWithdrawsTheRefsItNames(t *testing.T) {
 	}
 	both := [][]byte{firstRef, secondRef}
 	holding := c.groupState(t)
+	unheldRef := bytes.Repeat([]byte{0x5a}, 32)
+	longRef := bytes.Repeat([]byte{0xff}, 65)
 	// revoke builds a revoke op 27 whose vector holds parts byte for byte, for
 	// vectors buildRevokeBatch can't make.
 	revoke := func(parts ...[]byte) []byte {
 		return append([]byte{0x01}, writeVLBytes(bytes.Join(parts, nil))...)
 	}
-	// short ends after firstRef, though its vector's length counts secondRef too.
+	// short ends a byte before the vector its length announces. The byte stays
+	// in short's capacity, so a reader that slices past the end reads
+	// secondRef whole.
 	short := buildRevokeBatch(firstRef, secondRef)
-	short = short[:len(short)-len(writeVLBytes(secondRef))]
+	short = short[:len(short)-1]
+	names := func(refs [][]byte) []string {
+		out := make([]string, 0, len(refs))
+		for _, ref := range refs {
+			switch {
+			case bytes.Equal(ref, firstRef):
+				out = append(out, "first")
+			case bytes.Equal(ref, secondRef):
+				out = append(out, "second")
+			default:
+				out = append(out, hex.EncodeToString(ref))
+			}
+		}
+
+		return out
+	}
 
 	tests := []struct {
-		name string
-		op27 []byte
-		left [][]byte // the proposals the session still holds
+		name   string
+		op27   []byte
+		left   [][]byte // the proposals the session still holds
+		unheld []byte   // the ref a WARN names; nil when the session warns of nothing
 	}{
 		{name: "one ref", op27: buildRevokeBatch(firstRef), left: [][]byte{secondRef}},
 		{name: "both refs, the later one first", op27: buildRevokeBatch(secondRef, firstRef)},
+		{
+			name:   "a ref it doesn't hold, then one it does",
+			op27:   buildRevokeBatch(unheldRef, firstRef),
+			left:   [][]byte{secondRef},
+			unheld: unheldRef,
+		},
+		{
+			name:   "a ref longer than a hash, then one it holds",
+			op27:   buildRevokeBatch(longRef, firstRef),
+			left:   [][]byte{secondRef},
+			unheld: longRef,
+		},
 		{
 			name: "as many refs as maxRevokeRefs",
 			op27: buildRevokeBatch(slices.Repeat([][]byte{firstRef}, maxRevokeRefs)...),
@@ -102,14 +137,41 @@ func TestProcessProposalBatch_RevokeWithdrawsTheRefsItNames(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			c.restoreGroupState(t, holding)
+			logged := len(c.logs.String())
 
 			_ = c.processBatch(tt.op27)
 
 			if left := cachedProposalRefs(t, c.s); !sameRefs(left, tt.left) {
-				t.Errorf("the session holds %d proposals after the revoke, want %d", len(left), len(tt.left))
+				t.Errorf("the session holds %v after the revoke, want %v", names(left), names(tt.left))
+			}
+			warned := warnings(t, c.logs.String()[logged:])
+			switch {
+			case tt.unheld == nil && len(warned) > 0:
+				t.Errorf("the session logged a WARN, want none:\n%s", strings.Join(warned, "\n"))
+			case tt.unheld != nil && !slices.ContainsFunc(warned, func(line string) bool {
+				return strings.Contains(line, hex.EncodeToString(tt.unheld))
+			}):
+				t.Errorf("no WARN names the ref the session doesn't hold, %x", tt.unheld)
 			}
 		})
 	}
+}
+
+// warnings returns the lines of logs, slog's JSON output, logged at WARN.
+func warnings(tb testing.TB, logs string) []string {
+	tb.Helper()
+	var out []string
+	for line := range strings.Lines(logs) {
+		var record map[string]any
+		if err := json.Unmarshal([]byte(line), &record); err != nil {
+			tb.Fatalf("log line %q: %v", line, err)
+		}
+		if record[slog.LevelKey] == slog.LevelWarn.String() {
+			out = append(out, strings.TrimSpace(line))
+		}
+	}
+
+	return out
 }
 
 // TestReadRevokeRefs_ReadsWhatMlsppWrites reads revoke op 27s that mlspp

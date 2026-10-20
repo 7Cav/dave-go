@@ -896,13 +896,13 @@ func (s *Session) processAndCommitProposalBatchLocked(proposals []byte) {
 	// after processing" (protocol.md:176). A revoke, or a batch whose
 	// proposals were all refused, leaves some when a rollback brought back the
 	// proposals of our earlier commit.
-	cached, err := s.cachedProposalCountLocked()
+	cached, err := s.cachedProposalsLocked()
 	if err != nil {
 		s.logger.Error("failed to read cached proposals", "error", err)
 
 		return
 	}
-	if cached == 0 {
+	if len(cached) == 0 {
 		s.logger.Info("no cached mls proposals after processing, skipping commit",
 			"size", len(proposals))
 
