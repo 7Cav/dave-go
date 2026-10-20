@@ -6,6 +6,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"slices"
 	"strconv"
 	"time"
 
@@ -273,6 +274,46 @@ func (s *Session) processCommitLocked(commit []byte) error {
 		return err
 	}
 
+	s.pendingEpoch = epochState
+	s.pendingGroupID = append([]byte(nil), s.groupID...)
+
+	return nil
+}
+
+// sentCommit is a commit we sent and the group state it produced.
+type sentCommit struct {
+	commit []byte
+	state  []byte
+}
+
+// pendingCommitLocked returns our waiting commit with the group state it
+// produced, which the store holds until the commit is rolled back.
+func (s *Session) pendingCommitLocked() (sentCommit, error) {
+	state, err := s.mlsClient.store.LoadGroupState(context.Background(), group.NewGroupID(s.groupID))
+	if err != nil {
+		return sentCommit{}, fmt.Errorf("load state of our commit: %w", err)
+	}
+
+	return sentCommit{commit: s.pendingCommitBytes, state: state}, nil
+}
+
+// applyAnnouncedCommitLocked moves the group to the epoch an announced commit
+// starts. For one of our replaced commits it takes up the group state the
+// commit produced, since a committer can't decrypt its own update path. Any
+// other commit it processes.
+func (s *Session) applyAnnouncedCommitLocked(replaced []sentCommit, commit []byte) error {
+	i := slices.IndexFunc(replaced, func(c sentCommit) bool { return bytes.Equal(c.commit, commit) })
+	if i < 0 {
+		return s.processCommitLocked(commit)
+	}
+	s.logger.Info("gateway announced an earlier commit of ours, taking up its state")
+	if err := s.mlsClient.store.SaveGroupState(context.Background(), group.NewGroupID(s.groupID), replaced[i].state); err != nil {
+		return fmt.Errorf("take up state of our earlier commit: %w", err)
+	}
+	epochState, err := s.rebuildEpochStateLocked(s.groupID)
+	if err != nil {
+		return err
+	}
 	s.pendingEpoch = epochState
 	s.pendingGroupID = append([]byte(nil), s.groupID...)
 
@@ -929,6 +970,7 @@ func (s *Session) invalidateMLSStateLocked() {
 	s.pendingEpoch = nil
 	s.pendingCommitBytes = nil
 	s.preCommitGroupState = nil
+	s.replacedCommits = nil
 	s.proposalQueue = nil
 	s.pendingKeyPackage = nil
 	s.markDegradedLocked("invalid commit or welcome, MLS state reset")

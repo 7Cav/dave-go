@@ -132,6 +132,14 @@ type Session struct {
 	pendingCommitBytes  []byte
 	preCommitGroupState []byte
 
+	// replacedCommits holds each commit of ours that a later batch made us
+	// commit again over, with the group state it produced, until the epoch
+	// has a winner. The gateway can still announce one, for example after a
+	// revoke makes it valid again. MLS can't process a commit from our own leaf
+	// once the group has another member, so the session takes up the saved
+	// state instead.
+	replacedCommits []sentCommit
+
 	epochReady chan struct{}
 
 	// recoveryAttempts counts consecutive invalidate → new key package cycles
@@ -632,6 +640,7 @@ func (s *Session) OnSelectProtocolAck(protocolVersion uint16) {
 		s.pendingGroupID = nil
 		s.pendingCommitBytes = nil
 		s.preCommitGroupState = nil
+		s.replacedCommits = nil
 		s.proposalQueue = nil
 		s.recoveryAttempts = 0
 		s.resetEpochReadyLocked()
@@ -735,6 +744,7 @@ func (s *Session) OnDaveExecuteTransition(transitionID uint16) {
 		s.pendingGroupID = nil
 		s.pendingCommitBytes = nil
 		s.preCommitGroupState = nil
+		s.replacedCommits = nil
 		s.groupID = nil
 		s.resetEpochReadyLocked()
 		s.logger.Debug("downgrade to v0 executed: send-side cleared to passthrough",
@@ -771,6 +781,7 @@ func (s *Session) OnDavePrepareEpoch(epoch int, protocolVersion uint16) {
 	s.pendingGroupID = nil
 	s.pendingCommitBytes = nil
 	s.preCommitGroupState = nil
+	s.replacedCommits = nil
 	s.proposalQueue = nil
 	s.resetEpochReadyLocked()
 	// Same as OnSelectProtocolAck: keep the send ratchet alive through
@@ -832,8 +843,12 @@ func (s *Session) handleProposalBatchLocked(proposals []byte) {
 		// holds the commit's proposals, so the next commit covers them and this
 		// batch, as libdave's would, and a peer's commit over every batch can
 		// be processed too.
-		err := s.restorePreCommitStateLocked()
+		replaced, err := s.pendingCommitLocked()
 		if err == nil {
+			err = s.restorePreCommitStateLocked()
+		}
+		if err == nil {
+			s.replacedCommits = append(s.replacedCommits, replaced)
 			s.logger.Info("committing again over a proposal batch that arrived while our commit waited",
 				"size", len(proposals))
 			s.processAndCommitProposalBatchLocked(proposals)
@@ -909,10 +924,13 @@ func (s *Session) processAndCommitProposalBatchLocked(proposals []byte) {
 
 // reconcileCompetingCommitLocked handles the case where the DS echoed a commit
 // that is not ours: it rolls back any pending (lost) commit to the pre-commit
-// snapshot and then processes the winning commit. It returns false if the
+// snapshot and then processes the winning commit, or takes up the state of
+// the winner if it is one of our replaced commits. It returns false if the
 // transition must be aborted because the state restore or the commit processing
 // failed. Must be called with s.mu held.
 func (s *Session) reconcileCompetingCommitLocked(transitionID uint16, commitMessage []byte) bool {
+	replaced := s.replacedCommits
+	s.replacedCommits = nil
 	if len(s.pendingCommitBytes) > 0 {
 		// Our commit lost; restore pre-commit state before processing the winner.
 		s.logger.Debug("OnDaveMLSPrepareCommitTransition: competing commit won, rolling back",
@@ -927,7 +945,7 @@ func (s *Session) reconcileCompetingCommitLocked(transitionID uint16, commitMess
 		}
 	}
 
-	if err := s.processCommitLocked(commitMessage); err != nil {
+	if err := s.applyAnnouncedCommitLocked(replaced, commitMessage); err != nil {
 		s.stats.CommitsFailed++
 		s.logger.Error("failed to process commit", "transition_id", transitionID, "error", err)
 		s.sendInvalidCommitWelcomeLocked(transitionID)
@@ -967,6 +985,7 @@ func (s *Session) OnDaveMLSPrepareCommitTransition(transitionID uint16, commitMe
 		s.logger.Debug("skipping commit re-processing: we were the committer", "transition_id", transitionID)
 		s.pendingCommitBytes = nil
 		s.preCommitGroupState = nil
+		s.replacedCommits = nil
 	} else if !s.reconcileCompetingCommitLocked(transitionID, commitMessage) {
 		return
 	}
@@ -991,6 +1010,7 @@ func (s *Session) OnDaveMLSWelcome(transitionID uint16, welcomeMessage []byte) {
 
 	s.logger.Debug("OnDaveMLSWelcome", "transition_id", transitionID, "welcome_size", len(welcomeMessage))
 	s.pendingTransitionID = transitionID
+	s.replacedCommits = nil
 
 	// A Welcome after our own commit means Discord DS chose another member's
 	// commit over ours. Roll back to the pre-commit snapshot so that
