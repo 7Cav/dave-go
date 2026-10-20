@@ -348,8 +348,11 @@ func TestCommitRace_RevokeRevivesEarlierOwnCommit(t *testing.T) {
 						gw.connect(id)
 						gw.settle() // and again over every add so far
 					}
-					gw.disconnect(tt.later[len(tt.later)-1])
+					last := tt.later[len(tt.later)-1]
+					revoked := gw.addRef(last)
+					gw.disconnect(last)
 					gw.settle() // and again without the revoked add
+					gw.requireNotCached(revoked)
 					gw.releaseCommits()
 					gw.settle() // recorder's commit from before the revoked add arrives first and is valid again
 

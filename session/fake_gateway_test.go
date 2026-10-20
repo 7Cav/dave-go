@@ -1405,6 +1405,36 @@ func (g *fakeGateway) requireNothingCached() {
 	}
 }
 
+// addRef returns the ref of id's add in flight.
+func (g *fakeGateway) addRef(id godave.UserID) []byte {
+	g.t.Helper()
+	g.mu.Lock()
+	i := slices.IndexFunc(g.proposals, func(p gatewayProposal) bool { return p.adds == id })
+	var ref []byte
+	if i >= 0 {
+		ref = g.proposals[i].ref
+	}
+	g.mu.Unlock()
+	if ref == nil {
+		g.t.Fatalf("no add of %s is in flight", id)
+	}
+
+	return ref
+}
+
+// requireNotCached requires that no session holds the proposal ref names.
+func (g *fakeGateway) requireNotCached(ref []byte) {
+	g.t.Helper()
+	g.mu.Lock()
+	clients := slices.Clone(g.clients)
+	g.mu.Unlock()
+	for _, c := range clients {
+		if slices.ContainsFunc(cachedProposalRefs(g.t, c.s), func(r []byte) bool { return bytes.Equal(r, ref) }) {
+			g.t.Errorf("%s still holds the revoked proposal %x", c.id, ref)
+		}
+	}
+}
+
 // requireBatchOf requires that some op 27 the gateway delivered to id carried
 // at least n proposals. A batched test calls it so it can't pass without
 // taking a multi-proposal op 27 through a session.
