@@ -18,8 +18,8 @@ import (
 // raw identity bytes. Two calls with the same identity produce packages with
 // the SAME credential identity but DIFFERENT keys — used to force a group with
 // two members sharing a user ID.
-func freshKeyPackageBytesForIdentity(t *testing.T, identity []byte) []byte {
-	t.Helper()
+func freshKeyPackageBytesForIdentity(tb testing.TB, identity []byte) []byte {
+	tb.Helper()
 
 	store := memorystore.NewStore()
 	member, err := mls.NewClient(identity, ciphersuite.MLS128DHKEMP256,
@@ -27,11 +27,11 @@ func freshKeyPackageBytesForIdentity(t *testing.T, identity []byte) []byte {
 		mls.WithCacheStrategy(mls.CacheNone),
 	)
 	if err != nil {
-		t.Fatalf("mls.NewClient(identity=%x): %v", identity, err)
+		tb.Fatalf("mls.NewClient(identity=%x): %v", identity, err)
 	}
 	kp, err := member.FreshKeyPackageBytes(context.Background())
 	if err != nil {
-		t.Fatalf("FreshKeyPackageBytes(identity=%x): %v", identity, err)
+		tb.Fatalf("FreshKeyPackageBytes(identity=%x): %v", identity, err)
 	}
 
 	return kp

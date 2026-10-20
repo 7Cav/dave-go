@@ -147,14 +147,14 @@ func TestWaitShutdown_RespectsContext(t *testing.T) {
 
 // closeAtCleanup closes s when the test ends and waits for its watchdogs, so
 // none of them outlives the test and logs into a later one.
-func closeAtCleanup(t *testing.T, s *Session) {
-	t.Helper()
-	t.Cleanup(func() {
+func closeAtCleanup(tb testing.TB, s *Session) {
+	tb.Helper()
+	tb.Cleanup(func() {
 		_ = s.Close()
 		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 		defer cancel()
 		if err := s.WaitShutdown(ctx); err != nil {
-			t.Errorf("WaitShutdown: %v", err)
+			tb.Errorf("WaitShutdown: %v", err)
 		}
 	})
 }

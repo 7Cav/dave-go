@@ -46,16 +46,16 @@ func buildExternalSenderPackage(t *testing.T) []byte {
 // returns the ECDH private key so tests can sign proposals as the external
 // sender (simulating the gateway, which is how DAVE delivers proposals in
 // reality — not as a group member).
-func buildExternalSenderPackageWithKey(t *testing.T) ([]byte, *ecdsa.PrivateKey) {
-	t.Helper()
+func buildExternalSenderPackageWithKey(tb testing.TB) ([]byte, *ecdsa.PrivateKey) {
+	tb.Helper()
 
 	priv, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	if err != nil {
-		t.Fatalf("generate external sender key: %v", err)
+		tb.Fatalf("generate external sender key: %v", err)
 	}
 	ecdhPub, err := priv.PublicKey.ECDH()
 	if err != nil {
-		t.Fatalf("convert external sender key to ECDH: %v", err)
+		tb.Fatalf("convert external sender key to ECDH: %v", err)
 	}
 
 	cred := credentials.NewBasicCredentialFromUint64(1)
