@@ -268,8 +268,8 @@ func TestCommitRace_MemberLeavesAsAnotherJoins(t *testing.T) {
 // TestCommitRace_RevokeWhileOwnCommitWaits revokes a proposal the waiting
 // commits cover. Members must commit again over the proposals left. When none
 // are left, they must hold nothing and commit nothing. A commit nobody can
-// accept would restart DAVE when its watchdog fires. No member ever has two proposals queued at
-// once, so batching changes nothing here.
+// accept would restart DAVE when its watchdog fires. No member ever has two
+// proposals queued at once, so batching changes nothing here.
 func TestCommitRace_RevokeWhileOwnCommitWaits(t *testing.T) {
 	for _, f := range proposalFramings() {
 		t.Run(f.name, func(t *testing.T) {
@@ -307,6 +307,7 @@ func TestCommitRace_RevokeWhileOwnCommitWaits(t *testing.T) {
 				gw.settle()
 				gw.requireNoRestart()
 				gw.requireNoCommitSince(sent)
+				gw.requireNothingCached()
 				gw.resetRecoveryTimeout()
 				gw.connect(joiner2)
 				gw.settle()
@@ -385,6 +386,68 @@ func TestCommitRace_RefusedBatchWhileOwnCommitWaits(t *testing.T) {
 			gw.requireWinner(1, recorder)
 			gw.requireNoRestart()
 			gw.requireConverged()
+		})
+	}
+}
+
+// TestCommitRace_RevokeNamesProposalNoMemberHolds revokes, in one op 27, an
+// add the waiting commits cover and a proposal every member refused. Members
+// must withdraw the add though they never held the other ref, then commit
+// again over the proposals left. When none are left, they must hold nothing
+// and commit nothing. Refusing the whole revoke would keep the add, and every
+// commit after it would cite a proposal the gateway revoked. No member ever
+// has two proposals queued at once, so batching changes nothing here.
+func TestCommitRace_RevokeNamesProposalNoMemberHolds(t *testing.T) {
+	for _, f := range proposalFramings() {
+		t.Run(f.name, func(t *testing.T) {
+			t.Run("a proposal is left", func(t *testing.T) {
+				gw := f.gateway(t)
+				gw.establish(recorder, speaker)
+				gw.holdCommits()
+				gw.connect(joiner1)
+				gw.settle() // recorder and speaker commit over add(joiner1)
+				gw.connect(joiner2)
+				gw.settle() // and again over add(joiner2)
+				gw.proposeRefused()
+				gw.settle()
+				gw.receiveCommits(recorder, speaker) // none covers the refused proposal, so none wins
+				gw.disconnectRevokingRefused(joiner1)
+				gw.releaseCommits()
+				gw.settle()
+
+				gw.requireWinner(1, recorder)
+				gw.requireNoRestart()
+				gw.requireConverged()
+			})
+			t.Run("nothing is left", func(t *testing.T) {
+				const recoveryTimeout = 500 * time.Millisecond
+				gw := f.gateway(t, sessionRecoveryTimeout(recoveryTimeout))
+				gw.establish(recorder, speaker)
+				gw.holdCommits()
+				gw.connect(joiner1)
+				gw.settle() // recorder and speaker commit over add(joiner1)
+				gw.proposeRefused()
+				gw.settle()
+				gw.receiveCommits(recorder, speaker)
+				sent := gw.commitsSent()
+				gw.disconnectRevokingRefused(joiner1)
+				gw.settle() // the revoke leaves no proposal any member holds
+				gw.requireNothingCached()
+				gw.releaseCommits()
+				gw.settle()
+				time.Sleep(2 * recoveryTimeout)
+				gw.settle()
+				gw.requireNoRestart()
+				gw.requireNoCommitSince(sent)
+				gw.requireNothingCached()
+				gw.resetRecoveryTimeout()
+				gw.connect(joiner2)
+				gw.settle()
+
+				gw.requireWinner(1, recorder)
+				gw.requireNoRestart()
+				gw.requireConverged()
+			})
 		})
 	}
 }

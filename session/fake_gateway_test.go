@@ -302,6 +302,22 @@ func (g *fakeGateway) connect(id godave.UserID, opts ...Option) *Session {
 // and tells the others it left with op 13.
 func (g *fakeGateway) disconnect(id godave.UserID) {
 	g.t.Helper()
+	g.disconnectRevoking(id, func(gatewayProposal) bool { return false })
+}
+
+// disconnectRevokingRefused takes the pending member id off the call like
+// disconnect, but the gateway revokes its add in one op 27 together with every
+// proposal proposeRefused sent, which no member holds.
+func (g *fakeGateway) disconnectRevokingRefused(id godave.UserID) {
+	g.t.Helper()
+	g.disconnectRevoking(id, func(p gatewayProposal) bool { return p.what == "psk" })
+}
+
+// disconnectRevoking takes the pending member id off the call. In one op 27,
+// the gateway revokes the member's add and every other proposal in flight that
+// also picks. Then it tells the others the member left with op 13.
+func (g *fakeGateway) disconnectRevoking(id godave.UserID, also func(gatewayProposal) bool) {
+	g.t.Helper()
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	c := g.clientLocked(id)
@@ -312,7 +328,10 @@ func (g *fakeGateway) disconnect(id godave.UserID) {
 	}
 	g.clients = slices.DeleteFunc(g.clients, func(o *fakeClient) bool { return o == c })
 	g.eventf("%s disconnects", id)
-	g.revokeAddLocked(c)
+	revoked := slices.DeleteFunc(slices.Clone(g.proposals), func(p gatewayProposal) bool { return p.adds != id && !also(p) })
+	if len(revoked) > 0 {
+		g.revokeLocked(revoked...)
+	}
 	for _, o := range g.clients {
 		o.inbox = append(o.inbox, clientDisconnect(id))
 	}
@@ -878,14 +897,31 @@ func (g *fakeGateway) revokeAddLocked(c *fakeClient) {
 	}
 }
 
-func (g *fakeGateway) revokeLocked(p gatewayProposal) {
-	g.proposals = slices.DeleteFunc(g.proposals, func(q gatewayProposal) bool { return bytes.Equal(q.ref, p.ref) })
-	for _, c := range p.to {
-		if slices.Contains(g.clients, c) {
-			c.inbox = append(c.inbox, proposalsMessage(buildRevokeBatch(p.ref), "revoke "+p.what))
+// revokeLocked revokes ps in one op 27, sent to each client still on the call
+// that got any of them.
+func (g *fakeGateway) revokeLocked(ps ...gatewayProposal) {
+	var refs [][]byte
+	var whats []string
+	var to []*fakeClient
+	for _, p := range ps {
+		refs = append(refs, p.ref)
+		whats = append(whats, p.what)
+		for _, c := range p.to {
+			if !slices.Contains(to, c) {
+				to = append(to, c)
+			}
 		}
 	}
-	g.eventf("epoch %d: revoke %s", g.epoch, p.what)
+	g.proposals = slices.DeleteFunc(g.proposals, func(q gatewayProposal) bool {
+		return slices.ContainsFunc(refs, func(ref []byte) bool { return bytes.Equal(q.ref, ref) })
+	})
+	what := "revoke " + strings.Join(whats, ", ")
+	for _, c := range to {
+		if slices.Contains(g.clients, c) {
+			c.inbox = append(c.inbox, proposalsMessage(buildRevokeBatch(refs...), what))
+		}
+	}
+	g.eventf("epoch %d: %s", g.epoch, what)
 }
 
 // membersLocked returns the roster members whose leaves aren't stale, in
@@ -1342,8 +1378,8 @@ func (g *fakeGateway) commitsSent() map[godave.UserID]int {
 	return sent
 }
 
-// requireNoCommitSince requires that no session has sent an op 28 since
-// commitsSent returned before, whether or not the gateway took it.
+// requireNoCommitSince requires that no session has sent an op 28 since the
+// commitsSent call that returned before, whether or not the gateway took it.
 func (g *fakeGateway) requireNoCommitSince(before map[godave.UserID]int) {
 	g.t.Helper()
 	g.mu.Lock()
