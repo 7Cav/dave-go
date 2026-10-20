@@ -1253,47 +1253,64 @@ func (s *Session) commitProposalsLocked() error {
 	return nil
 }
 
-// proposalRefSize is the length of an MLS ProposalRef (HashReference<V>) for
-// the ciphersuite DAVE requires: MLS128DHKEMP256 -> SHA-256 -> 32 bytes.
-// Confirmed against mls-go/ciphersuite/hash_ref.go + coverage_test.go:59.
-const proposalRefSize = 32
-
 // maxRevokeRefs is a defensive ceiling against corrupted gateway payloads
 // (a real revoke never carries hundreds of refs at once).
 const maxRevokeRefs = 256
 
-// processRevokeProposalsLocked handles DAVE opcode 27 with operation_type=1
-// (protocol.md:1020-1048): payload = TLSVector<ProposalRef>, each ref 32 bytes.
-// Delegates to mls.Client.RevokeProposals, which removes the proposals from
-// the local pending store and proposalByRef lookup; idempotent.
-func (s *Session) processRevokeProposalsLocked(payload []byte) error {
+// readRevokeRefs reads the refs of a revoke op 27 from the payload after
+// operation_type: ProposalRef proposal_refs<V> (protocol.md:1020-1048). A
+// ProposalRef is an opaque HashReference<V> (RFC 9420 §5.2), so each ref in
+// the vector is a varint length and then that many bytes, as mlspp writes it
+// for libdave. It refuses the whole revoke if the vector runs past the
+// payload, ends inside a ref or holds more than maxRevokeRefs refs. Like
+// libdave, it takes a ref of any length. A ref that isn't 32 bytes can't name
+// a cached proposal, so it withdraws nothing. Neither does a 32-byte ref the
+// group doesn't hold.
+func readRevokeRefs(payload []byte) ([][]byte, error) {
 	vecLen, headerSize, err := readTLSVectorLength(payload)
 	if err != nil {
-		return fmt.Errorf("reading revoke vector length: %w", err)
+		return nil, fmt.Errorf("reading revoke vector length: %w", err)
 	}
 	end := headerSize + int(vecLen)
 	if end > len(payload) {
-		return fmt.Errorf("%w: need %d bytes, have %d", ErrProposalsTruncated, end, len(payload))
+		return nil, fmt.Errorf("%w: need %d bytes, have %d", ErrProposalsTruncated, end, len(payload))
 	}
 
 	body := payload[headerSize:end]
-	if len(body) == 0 {
+	var refs [][]byte
+	for len(body) > 0 {
+		if len(refs) == maxRevokeRefs {
+			return nil, fmt.Errorf("%w: more than %d refs", ErrProposalsTooMany, maxRevokeRefs)
+		}
+		refLen, n, err := readTLSVectorLength(body)
+		if err != nil {
+			return nil, fmt.Errorf("reading length of revoke ref %d: %w", len(refs), err)
+		}
+		refEnd := n + int(refLen)
+		if refEnd > len(body) {
+			return nil, fmt.Errorf("%w: revoke ref %d needs %d bytes, have %d",
+				ErrProposalsTruncated, len(refs), refEnd, len(body))
+		}
+		refs = append(refs, body[n:refEnd])
+		body = body[refEnd:]
+	}
+
+	return refs, nil
+}
+
+// processRevokeProposalsLocked handles DAVE opcode 27 with operation_type=1.
+// It withdraws each cached proposal the revoke names through
+// mls.Client.RevokeProposals, which skips a ref the group doesn't hold. A
+// revoke that readRevokeRefs refuses withdraws nothing.
+func (s *Session) processRevokeProposalsLocked(payload []byte) error {
+	refs, err := readRevokeRefs(payload)
+	if err != nil {
+		return err
+	}
+	if len(refs) == 0 {
 		s.logger.Debug("processRevokeProposalsLocked: revoke batch empty")
 
 		return nil
-	}
-	if len(body)%proposalRefSize != 0 {
-		return fmt.Errorf("%w: revoke body %d bytes not multiple of %d",
-			ErrProposalsTruncated, len(body), proposalRefSize)
-	}
-
-	n := len(body) / proposalRefSize
-	if n > maxRevokeRefs {
-		return fmt.Errorf("%w: %d refs exceeds %d", ErrProposalsTooMany, n, maxRevokeRefs)
-	}
-	refs := make([][]byte, 0, n)
-	for i := 0; i < len(body); i += proposalRefSize {
-		refs = append(refs, append([]byte(nil), body[i:i+proposalRefSize]...))
 	}
 	s.logger.Debug("processProposalBatchLocked: revoke",
 		"ref_count", len(refs),

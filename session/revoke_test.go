@@ -1,68 +1,161 @@
 package session
 
 import (
-	"strings"
+	"bytes"
+	"context"
+	"encoding/hex"
+	"slices"
 	"sync"
 	"testing"
+
+	"github.com/thomas-vilte/mls-go/group"
 )
 
-// buildRevokeBatch builds a DAVE opcode 27 payload with operation_type=1 (revoke):
-// uint8(1) || TLSVector<ProposalRef[32 bytes]>. The wire format is documented in
-// protocol.md:1020-1048.
-func buildRevokeBatch(refs []byte) []byte {
-	return append([]byte{0x01}, writeVLBytes(refs)...)
-}
-
-// TestProcessRevokeProposalsLocked_WireFormat covers the parsing of the revoke
-// branch (operation_type=1) in processProposalBatchLocked without requiring a
-// real MLS group or network — it validates the TLSVector format, the 32-byte
-// ProposalRef alignment, and the defensive ceilings. The real happy path
-// (valid refs → g.RevokeProposal) is covered in mls-go with a real peer.
-func TestProcessRevokeProposalsLocked_WireFormat(t *testing.T) {
-	cb := &kpCapturingCallbacks{}
-	s := New("123456789", cb)
-	// OnSelectProtocolAck with a non-zero version initializes s.mlsClient (see
-	// ensureMLSClientLocked in mls.go). Without this, RevokeProposals would
-	// panic on s.mlsClient == nil.
-	s.OnSelectProtocolAck(1)
-
-	// Set an arbitrary groupID (not present in the store) so the handler
-	// reaches RevokeProposals; loadGroupEntry fails with "no such group",
-	// which gets wrapped in "revoke proposals:" — exactly what we match
-	// against in wantErr.
-	s.mu.Lock()
-	s.groupID = []byte("group-nonexistent")
-	s.mu.Unlock()
-
-	cases := []struct {
-		name    string
-		payload []byte
-		wantErr string
-	}{
-		{"empty refs batch", buildRevokeBatch(nil), ""},
-		{"one valid ref 32 bytes", buildRevokeBatch(make([]byte, 32)), "revoke proposals:"},
-		{"two valid refs 64 bytes", buildRevokeBatch(make([]byte, 64)), "revoke proposals:"},
-		{"bad body len not multiple of 32", buildRevokeBatch(make([]byte, 33)), "not multiple of 32"},
-		{"truncated vector", []byte{0x01, 0x20}, "truncated"},
-		{"too many refs exceeds maxRevokeRefs", buildRevokeBatch(make([]byte, maxRevokeRefs*32+32)), "too many"},
+// buildRevokeBatch builds a revoke op 27 payload: operation_type 1, then
+// ProposalRef proposal_refs<V> (protocol.md:1020-1048). A ProposalRef is an
+// opaque HashReference<V>, so each ref carries its own length inside the
+// vector, the way mlspp writes it for libdave.
+func buildRevokeBatch(refs ...[]byte) []byte {
+	var body []byte
+	for _, ref := range refs {
+		body = append(body, writeVLBytes(ref)...)
 	}
 
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			// processRevokeProposalsLocked receives the payload after
-			// operation_type (the first byte), so we strip it here.
-			payload := tc.payload[1:]
+	return append([]byte{0x01}, writeVLBytes(body)...)
+}
 
-			err := s.processRevokeProposalsLocked(payload)
-			switch {
-			case tc.wantErr == "":
-				if err != nil {
-					t.Errorf("unexpected error: %v", err)
-				}
-			case err == nil:
-				t.Errorf("expected error containing %q, got nil", tc.wantErr)
-			case !strings.Contains(err.Error(), tc.wantErr):
-				t.Errorf("err = %q, want substring %q", err.Error(), tc.wantErr)
+// cachedProposalRefs returns the refs of the proposals s holds that no
+// announced commit covers yet. While a commit of its own waits, those are the
+// ones that commit cites. Otherwise they are the ones its group holds for its
+// next commit. A session with no group holds none.
+func cachedProposalRefs(tb testing.TB, s *Session) [][]byte {
+	tb.Helper()
+	s.lockMLS()
+	defer s.unlockMLS()
+	if s.mlsClient == nil || len(s.groupID) == 0 {
+		return nil
+	}
+	state := s.preCommitGroupState
+	if len(state) == 0 {
+		var err error
+		state, err = s.mlsClient.store.LoadGroupState(context.Background(), group.NewGroupID(s.groupID))
+		if err != nil {
+			tb.Fatalf("load group state: %v", err)
+		}
+	}
+	g, err := group.UnmarshalGroupState(state)
+	if err != nil {
+		tb.Fatalf("unmarshal group state: %v", err)
+	}
+	stored := g.StoredProposals()
+	refs := make([][]byte, 0, len(stored))
+	for _, p := range stored {
+		refs = append(refs, p.Ref)
+	}
+
+	return refs
+}
+
+// TestProcessProposalBatch_RevokeWithdrawsTheRefsItNames hands a session that
+// holds two proposals a revoke op 27. The session withdraws each proposal the
+// revoke names. A revoke it can't read, or one with more refs than
+// maxRevokeRefs, withdraws nothing.
+func TestProcessProposalBatch_RevokeWithdrawsTheRefsItNames(t *testing.T) {
+	c := newBatchCall(t, speaker, joiner1)
+	first, firstRef := c.add(t, speaker)
+	second, secondRef := c.add(t, joiner1)
+	if err := c.processBatch(buildProposalBatch(bytes.Join([][]byte{first, second}, nil))); err != nil {
+		t.Fatalf("setup: %v", err)
+	}
+	both := [][]byte{firstRef, secondRef}
+	holding := c.groupState(t)
+	// revoke builds a revoke op 27 whose vector holds parts byte for byte, for
+	// vectors buildRevokeBatch can't make.
+	revoke := func(parts ...[]byte) []byte {
+		return append([]byte{0x01}, writeVLBytes(bytes.Join(parts, nil))...)
+	}
+	// short ends after firstRef, though its vector's length counts secondRef too.
+	short := buildRevokeBatch(firstRef, secondRef)
+	short = short[:len(short)-len(writeVLBytes(secondRef))]
+
+	tests := []struct {
+		name string
+		op27 []byte
+		left [][]byte // the proposals the session still holds
+	}{
+		{name: "one ref", op27: buildRevokeBatch(firstRef), left: [][]byte{secondRef}},
+		{name: "both refs, the later one first", op27: buildRevokeBatch(secondRef, firstRef)},
+		{
+			name: "as many refs as maxRevokeRefs",
+			op27: buildRevokeBatch(slices.Repeat([][]byte{firstRef}, maxRevokeRefs)...),
+			left: [][]byte{secondRef},
+		},
+		{
+			name: "more refs than maxRevokeRefs",
+			op27: buildRevokeBatch(slices.Repeat([][]byte{firstRef}, maxRevokeRefs+1)...),
+			left: both,
+		},
+		{name: "the vector ends inside a ref's length", op27: revoke(writeVLBytes(firstRef), []byte{0x40}), left: both},
+		{name: "the vector ends inside a ref", op27: revoke(writeVLBytes(firstRef), []byte{0x20}, secondRef[:31]), left: both},
+		{name: "the vector runs past the op 27", op27: short, left: both},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			c.restoreGroupState(t, holding)
+
+			_ = c.processBatch(tt.op27)
+
+			if left := cachedProposalRefs(t, c.s); !sameRefs(left, tt.left) {
+				t.Errorf("the session holds %d proposals after the revoke, want %d", len(left), len(tt.left))
+			}
+		})
+	}
+}
+
+// TestReadRevokeRefs_ReadsWhatMlsppWrites reads revoke op 27s that mlspp
+// encoded, at 1cc50a124a3bc4e143a787ec934280dc70c1034d, the commit libdave
+// pins. A short C++ driver, compiled with only mlspp's lib/tls_syntax and
+// lib/bytes, wrote the operation type as the bool true and then the refs as a
+// std::vector<bytes>, the types libdave's ProcessProposals reads. The op27
+// strings are the hex it printed. buildRevokeBatch made none of these bytes,
+// so the reader can't pass by sharing a mistake with it.
+func TestReadRevokeRefs_ReadsWhatMlsppWrites(t *testing.T) {
+	refA := "a0a1a2a3a4a5a6a7a8a9aaabacadaeafb0b1b2b3b4b5b6b7b8b9babbbcbdbebf"
+	refB := "05060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f2021222324"
+	tests := []struct {
+		name string
+		op27 string
+		want []string
+	}{
+		{
+			name: "one ref",
+			op27: "012120a0a1a2a3a4a5a6a7a8a9aaabacadaeafb0b1b2b3b4b5b6b7b8b9babbbcbdbebf",
+			want: []string{refA},
+		},
+		{
+			name: "two refs",
+			op27: "01404220a0a1a2a3a4a5a6a7a8a9aaabacadaeafb0b1b2b3b4b5b6b7b8b9babbbcbdbebf" +
+				"2005060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f2021222324",
+			want: []string{refA, refB},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			op27, err := hex.DecodeString(tt.op27)
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			refs, err := readRevokeRefs(op27[1:]) // the payload after operation_type
+			if err != nil {
+				t.Fatalf("the reader refused the revoke: %v", err)
+			}
+			got := make([]string, 0, len(refs))
+			for _, ref := range refs {
+				got = append(got, hex.EncodeToString(ref))
+			}
+			if !slices.Equal(got, tt.want) {
+				t.Errorf("read refs %v, want %v", got, tt.want)
 			}
 		})
 	}
@@ -96,7 +189,7 @@ func TestOnDaveMLSProposals_RevokeSkipsCommit(t *testing.T) {
 	// Revoke batch with 0 refs (success/no-op path). The handler must reach
 	// the early return in processAndCommitProposalBatchLocked without
 	// invoking a commit.
-	batch := buildRevokeBatch(nil)
+	batch := buildRevokeBatch()
 	s.OnDaveMLSProposals(batch)
 
 	cb.mu.Lock()
