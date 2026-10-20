@@ -32,6 +32,7 @@ const (
 	joiner1  godave.UserID = "333333333"
 	joiner2  godave.UserID = "444444444"
 	joiner3  godave.UserID = "555555555"
+	joiner4  godave.UserID = "666666666"
 )
 
 const (
@@ -68,7 +69,8 @@ type clientMessage struct {
 type serverMessage struct {
 	what      string
 	apply     func(*Session)
-	proposals bool // an op 27
+	proposals bool     // an op 27
+	appends   [][]byte // the MLSMessages of an append op 27, in order
 }
 
 // gatewaySender is the voice gateway's MLS external sender. It holds the op 25
@@ -142,6 +144,8 @@ type fakeClient struct {
 	outbox []clientMessage
 	// commits counts the op 28s received per epoch, for commitInfo.nth.
 	commits map[uint64]int
+	// largestBatch is the most proposals any op 27 delivered to it carried.
+	largestBatch int
 }
 
 type gatewayTransition struct {
@@ -161,6 +165,7 @@ type executedTransition struct {
 type gatewayOptions struct {
 	proposeDuringTransition bool
 	recoveryTimeout         time.Duration
+	batchProposals          bool
 }
 
 type gatewayOption func(*gatewayOptions)
@@ -169,6 +174,14 @@ type gatewayOption func(*gatewayOptions)
 // as soon as it announces a commit, instead of after op 22.
 func proposeDuringTransition() gatewayOption {
 	return func(o *gatewayOptions) { o.proposeDuringTransition = true }
+}
+
+// batchProposals makes the gateway put append proposals queued for a member
+// one after another into one op 27, in their order, as protocol.md lets it
+// for large or busy calls. Any other message queued between two appends,
+// such as a revoke or an announce, keeps them in separate op 27s.
+func batchProposals() gatewayOption {
+	return func(o *gatewayOptions) { o.batchProposals = true }
 }
 
 // sessionRecoveryTimeout gives every session the recovery timeout d instead
@@ -269,7 +282,7 @@ func (g *fakeGateway) connect(id godave.UserID, opts ...Option) *Session {
 	c.inbox = append(c.inbox, selectProtocolAck(1), clientsConnect(ids(others)), externalSenderPackage(g.sender.pkg))
 	if !g.established {
 		for i, p := range g.proposals {
-			c.inbox = append(c.inbox, proposalsMessage(buildProposalBatch(p.msg), p.what))
+			g.queueAppendLocked(c, p.msg, p.what)
 			g.proposals[i].to = append(p.to, c)
 		}
 	}
@@ -438,6 +451,9 @@ func (g *fakeGateway) deliver() int {
 	for _, c := range g.clients {
 		if len(c.inbox) == 0 {
 			continue
+		}
+		for _, m := range c.inbox {
+			c.largestBatch = max(c.largestBatch, len(m.appends))
 		}
 		batches = append(batches, batch{s: c.s, msgs: c.inbox})
 		n += len(c.inbox)
@@ -754,8 +770,9 @@ func (g *fakeGateway) invalidLocked(c *fakeClient, id uint16) {
 
 // reproposeLocked proposes, at the current epoch, a remove for each stale
 // member's leaf, then an add for each client holding a key package, in
-// connection order. Each goes in an op 27 of its own to the members whose
-// leaves aren't stale. Proposals already in flight aren't sent again.
+// connection order, to the members whose leaves aren't stale. Each goes in an
+// op 27 of its own unless the gateway batches proposals. Proposals already in
+// flight aren't sent again.
 func (g *fakeGateway) reproposeLocked() {
 	if !g.established {
 		return
@@ -786,10 +803,9 @@ func (g *fakeGateway) proposeAddLocked(c *fakeClient, to []*fakeClient) {
 	g.proposeLocked(group.NewAddProposal(k), gatewayProposal{what: fmt.Sprintf("add(%s)", c.id), adds: c.id}, to)
 }
 
-// proposeLocked signs p at the gateway's epoch, records it and sends it to to,
-// in an op 27 of its own. dave-go can take in only one proposal per append
-// batch with mls-go v1.6.0, and sending them one at a time also means every
-// batch after the first in an epoch reaches a member whose commit waits.
+// proposeLocked signs p at the gateway's epoch, records it and sends it to to.
+// Unless the gateway batches proposals, it goes in an op 27 of its own, so
+// every batch after the first in an epoch reaches a member whose commit waits.
 func (g *fakeGateway) proposeLocked(p *group.Proposal, meta gatewayProposal, to []*fakeClient) {
 	msg, ref, err := g.sender.propose(g.groupID, g.epoch, p)
 	if err != nil {
@@ -800,9 +816,22 @@ func (g *fakeGateway) proposeLocked(p *group.Proposal, meta gatewayProposal, to 
 	meta.msg, meta.ref, meta.to = msg, ref, to
 	g.proposals = append(g.proposals, meta)
 	for _, c := range to {
-		c.inbox = append(c.inbox, proposalsMessage(buildProposalBatch(msg), meta.what))
+		g.queueAppendLocked(c, msg, meta.what)
 	}
 	g.eventf("epoch %d: propose %s to %v", g.epoch, meta.what, ids(to))
+}
+
+// queueAppendLocked queues the proposal msg for c in an append op 27. When the
+// gateway batches proposals and the last message queued for c is an append
+// op 27, msg joins that one.
+func (g *fakeGateway) queueAppendLocked(c *fakeClient, msg []byte, what string) {
+	if n := len(c.inbox); g.opts.batchProposals && n > 0 && len(c.inbox[n-1].appends) > 0 {
+		last := c.inbox[n-1]
+		c.inbox[n-1] = appendProposals(append(slices.Clone(last.appends), msg), last.what+", "+what)
+
+		return
+	}
+	c.inbox = append(c.inbox, appendProposals([][]byte{msg}, "op 27 "+what))
 }
 
 // revokeAddLocked revokes c's add if one is in flight.
@@ -953,6 +982,14 @@ func externalSenderPackage(pkg []byte) serverMessage {
 
 func proposalsMessage(batch []byte, what string) serverMessage {
 	return serverMessage{what: "op 27 " + what, apply: func(s *Session) { s.OnDaveMLSProposals(batch) }, proposals: true}
+}
+
+// appendProposals is an append op 27 carrying msgs, the MLSMessages one after
+// another in one vector.
+func appendProposals(msgs [][]byte, what string) serverMessage {
+	batch := buildProposalBatch(bytes.Join(msgs, nil))
+
+	return serverMessage{what: what, apply: func(s *Session) { s.OnDaveMLSProposals(batch) }, proposals: true, appends: msgs}
 }
 
 func announceCommit(id uint16, commit []byte) serverMessage {
@@ -1250,6 +1287,24 @@ func (g *fakeGateway) requireRestartsOnly(users ...godave.UserID) {
 func (g *fakeGateway) requireNoRestart() {
 	g.t.Helper()
 	g.requireRestartsOnly()
+}
+
+// requireBatchOf requires that some op 27 the gateway delivered to id carried
+// at least n proposals. A batched test calls it so it can't pass without
+// taking a multi-proposal op 27 through a session.
+func (g *fakeGateway) requireBatchOf(id godave.UserID, n int) {
+	g.t.Helper()
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	c := g.clientLocked(id)
+	if c == nil {
+		g.t.Errorf("%s is not on the call", id)
+
+		return
+	}
+	if c.largestBatch < n {
+		g.t.Errorf("%s got no op 27 with %d or more proposals; the largest carried %d", id, n, c.largestBatch)
+	}
 }
 
 // requireReady requires id's session to be encrypting.
