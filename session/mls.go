@@ -297,6 +297,37 @@ func (s *Session) pendingCommitLocked() (sentCommit, error) {
 	return sentCommit{commit: s.pendingCommitBytes, state: state}, nil
 }
 
+// batchOnPreCommitEpochLocked reports whether a proposal batch was signed for
+// the epoch our waiting commit was built on. Only then can a new commit over it
+// compete for that epoch. If an append batch for the next epoch overtakes the
+// op 29 that starts it, the batch waits for that epoch instead. The gateway
+// signs every proposal in a batch at one epoch, so the first one decides. A
+// revoke carries only proposal refs, so it counts as signed for our commit's
+// epoch, and so does a batch this function can't parse.
+func (s *Session) batchOnPreCommitEpochLocked(proposals []byte) bool {
+	if len(proposals) < 1 || proposals[0] != 0 {
+		return true
+	}
+	vecLen, headerSize, err := readTLSVectorLength(proposals[1:])
+	if err != nil || headerSize+int(vecLen) > len(proposals)-1 {
+		return true
+	}
+	msg, err := framing.UnmarshalMLSMessage(proposals[1+headerSize : 1+headerSize+int(vecLen)])
+	if err != nil {
+		return true
+	}
+	pub, ok := msg.AsPublic()
+	if !ok || pub == nil {
+		return true
+	}
+	pre, err := group.UnmarshalGroupState(s.preCommitGroupState)
+	if err != nil {
+		return true
+	}
+
+	return pub.Content.Epoch == uint64(pre.Epoch())
+}
+
 // applyAnnouncedCommitLocked moves the group to the epoch an announced commit
 // starts. For one of our replaced commits it takes up the group state the
 // commit produced, since a committer can't decrypt its own update path. Any

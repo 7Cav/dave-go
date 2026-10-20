@@ -835,7 +835,7 @@ func (s *Session) OnDaveMLSProposals(proposals []byte) {
 // proposal, or queues the batch behind a pending epoch the session can't
 // commit over. Must be called with sendMu and s.mu held.
 func (s *Session) handleProposalBatchLocked(proposals []byte) {
-	if len(s.pendingCommitBytes) > 0 {
+	if len(s.pendingCommitBytes) > 0 && s.batchOnPreCommitEpochLocked(proposals) {
 		// Our commit waits for op 29. The gateway only broadcasts a commit that
 		// references every proposal it broadcast in the epoch (protocol.md
 		// "Voice Gateway Commit Validity"), so after this batch our commit
@@ -860,7 +860,8 @@ func (s *Session) handleProposalBatchLocked(proposals []byte) {
 
 	// A pending epoch from a peer's commit, a Welcome, or our commit after op 29
 	// confirmed it is the group the gateway moved to. The batch waits for that
-	// epoch to activate, and so does a batch whose rollback failed.
+	// epoch to activate. So does a batch whose rollback failed, and one signed
+	// for another epoch than the one our waiting commit was built on.
 	if s.pendingEpoch != nil {
 		s.logger.Debug("OnDaveMLSProposals: pendingEpoch in flight, queuing proposals", "queue_len", len(s.proposalQueue)+1)
 		s.proposalQueue = append(s.proposalQueue, append([]byte(nil), proposals...))

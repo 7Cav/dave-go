@@ -66,8 +66,9 @@ type clientMessage struct {
 // for the history a failure prints, and apply makes the handler call that
 // delivers it.
 type serverMessage struct {
-	what  string
-	apply func(*Session)
+	what      string
+	apply     func(*Session)
+	proposals bool // an op 27
 }
 
 // gatewaySender is the voice gateway's MLS external sender. It holds the op 25
@@ -342,6 +343,19 @@ func (g *fakeGateway) forceWinner(pick func(commitInfo) bool) {
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	g.force = pick
+}
+
+// proposalsOvertake moves the op 27s queued for id ahead of everything else
+// queued for it, as if a batch for the next epoch overtook the op 29 that
+// starts the epoch. A gateway that delivers in order can't do this.
+func (g *fakeGateway) proposalsOvertake(id godave.UserID) {
+	g.t.Helper()
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	c := g.clientLocked(id)
+	batches := slices.DeleteFunc(slices.Clone(c.inbox), func(m serverMessage) bool { return !m.proposals })
+	c.inbox = append(batches, slices.DeleteFunc(c.inbox, func(m serverMessage) bool { return m.proposals })...)
+	g.eventf("%s gets its op 27s first", id)
 }
 
 // holdCommits keeps op 28s on the wire until receiveCommits or releaseCommits.
@@ -923,7 +937,7 @@ func externalSenderPackage(pkg []byte) serverMessage {
 }
 
 func proposalsMessage(batch []byte, what string) serverMessage {
-	return serverMessage{what: "op 27 " + what, apply: func(s *Session) { s.OnDaveMLSProposals(batch) }}
+	return serverMessage{what: "op 27 " + what, apply: func(s *Session) { s.OnDaveMLSProposals(batch) }, proposals: true}
 }
 
 func announceCommit(id uint16, commit []byte) serverMessage {

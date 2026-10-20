@@ -162,33 +162,47 @@ func TestCommitRace_RevokeWhileOwnCommitWaits(t *testing.T) {
 	})
 }
 
-// TestCommitRace_RevokeRevivesEarlierOwnCommit revokes the batch that made the
-// members commit again before the gateway takes their first commits off the
-// wire. The first commit then cites every unrevoked proposal, so it wins by
-// the protocol's rule, and the session that sent it has to take up the group
-// state it produced. Processing its own commit would fail and restart DAVE.
+// TestCommitRace_RevokeRevivesEarlierOwnCommit has the gateway revoke the add
+// in the last batch that made the members commit again, before it takes their
+// commits off the wire. Recorder's commit from just before that batch then
+// cites every unrevoked proposal and wins by the protocol's rule. Recorder has
+// to take up the group state that commit produced, since processing its own
+// commit would fail and restart DAVE.
 func TestCommitRace_RevokeRevivesEarlierOwnCommit(t *testing.T) {
-	gw := newFakeGateway(t)
-	gw.establish(recorder, speaker)
-	gw.holdCommits()
-	gw.connect(joiner1)
-	gw.settle() // recorder and speaker commit over add(joiner1)
-	gw.connect(joiner2)
-	gw.settle() // and again over add(joiner2)
-	gw.disconnect(joiner2)
-	gw.settle() // and again over add(joiner1) alone
-	gw.releaseCommits()
-	gw.settle() // recorder's first commit arrives first and is valid again
+	for _, tt := range []struct {
+		name  string
+		later []godave.UserID // connected one at a time after joiner1; the last one's add is revoked
+	}{
+		{name: "the first commit wins", later: []godave.UserID{joiner2}},
+		{name: "a middle commit wins", later: []godave.UserID{joiner2, joiner3}},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			gw := newFakeGateway(t)
+			gw.establish(recorder, speaker)
+			gw.holdCommits()
+			gw.connect(joiner1)
+			gw.settle() // recorder and speaker commit over add(joiner1)
+			for _, id := range tt.later {
+				gw.connect(id)
+				gw.settle() // and again over every add so far
+			}
+			gw.disconnect(tt.later[len(tt.later)-1])
+			gw.settle() // and again without the revoked add
+			gw.releaseCommits()
+			gw.settle() // recorder's commit from before the revoked add arrives first and is valid again
 
-	gw.requireWinner(1, recorder)
-	gw.requireNoRestart()
-	gw.requireConverged()
+			gw.requireWinner(1, recorder)
+			gw.requireNoRestart()
+			gw.requireConverged()
+		})
+	}
 }
 
 // TestCommitRace_RefusedBatchWhileOwnCommitWaits sends, while the members'
 // commits wait, a batch every member refuses, then revokes it. The rollback
-// for the refused batch brings back the proposals of the waiting commit, so
-// a commit over them has to stay in flight for the revoke to let one win.
+// for the refused batch brings back the waiting commit's proposals. They stay
+// cached, so a commit over them wins once the gateway revokes the refused
+// proposal.
 func TestCommitRace_RefusedBatchWhileOwnCommitWaits(t *testing.T) {
 	gw := newFakeGateway(t)
 	gw.establish(recorder, speaker)
@@ -203,6 +217,30 @@ func TestCommitRace_RefusedBatchWhileOwnCommitWaits(t *testing.T) {
 	gw.settle()
 
 	gw.requireWinner(1, recorder)
+	gw.requireNoRestart()
+	gw.requireConverged()
+}
+
+// TestCommitRace_NextEpochBatchOvertakesAnnounce hands recorder the next
+// epoch's first batch ahead of the op 29 that confirms recorder's commit. A
+// gateway that delivers in order can't do this. The batch belongs to the epoch
+// that commit starts, so recorder holds it until op 22 and then commits over
+// it.
+func TestCommitRace_NextEpochBatchOvertakesAnnounce(t *testing.T) {
+	gw := newFakeGateway(t, proposeDuringTransition())
+	gw.establish(recorder, speaker)
+	gw.holdCommits()
+	gw.connect(joiner1)
+	gw.settle() // recorder and speaker commit over add(joiner1)
+	gw.connect(joiner2)
+	gw.deliver()                // joiner2 sends a key package
+	gw.receiveCommits(recorder) // recorder's commit wins; op 29 is queued
+	gw.releaseCommits()
+	gw.receive(joiner2) // add(joiner2) at epoch 2, queued behind op 29
+	gw.proposalsOvertake(recorder)
+	gw.settle()
+
+	gw.requireWinner(2, recorder)
 	gw.requireNoRestart()
 	gw.requireConverged()
 }
